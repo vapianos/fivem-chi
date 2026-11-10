@@ -15,14 +15,8 @@
 
 namespace {
 
-using Handler  = void(*)(void*);
-using Invoker  = void(*)(void*, uint64_t);
-
-struct Reg {
-    Reg*     next;
-    Handler  handler;
-    uint64_t hash;
-};
+using Handler = void(*)(void*);
+using Invoker = void(*)(void*, uint64_t);
 
 struct Abi {
     int ret, argCount, dataCount, args, hash;
@@ -39,11 +33,9 @@ struct alignas(16) Ctx {
 
 enum Mode { MODE_TABLE, MODE_INVOKER };
 
-Mode      g_mode   = MODE_TABLE;
-Reg**     g_table  = nullptr;
+Mode      g_mode  = MODE_INVOKER;
+void**    g_table = nullptr;
 Invoker   g_invoker = nullptr;
-uintptr_t g_game   = 0;
-size_t    g_size   = 0;
 int       g_hashOff    = 16;
 int       g_handlerOff = 8;
 Abi       g_abi{ 0x00, 0x08, 0x0C, 0x10, 0x18 };
@@ -55,16 +47,18 @@ unsigned  g_ticks = 0;
 std::atomic<bool>  g_esp{ true }, g_box{ true }, g_aim{ false }, g_god{ false }, g_jump{ false };
 std::atomic<bool>  g_skel{ true }, g_aimHold{ false };
 std::atomic<bool>  g_resolving{ false };
+std::atomic<bool>  g_scanStarted{ false };
+std::atomic<bool>  g_scanDone{ false };
 std::atomic<float> g_fov{ 90.0f };
 std::atomic<float> g_smooth{ 0.55f };
 
 struct NameCache { int ped = 0; ULONGLONG at = 0; char name[32]{}; };
 NameCache g_names[32];
 
-constexpr float kDeg     = 0.01745329252f;
-constexpr float kMaxDist = 500.0f;
+constexpr float kDeg      = 0.01745329252f;
+constexpr float kMaxDist  = 500.0f;
 constexpr float kSkelDist = 300.0f;
-constexpr float kAimDist = 300.0f;
+constexpr float kAimDist  = 300.0f;
 
 constexpr uint64_t N_PLAYER_PED_ID  = 0xD80958FC74E988A6;
 constexpr uint64_t N_PLAYER_ID      = 0x4F8644AF03D0E0D6;
@@ -84,8 +78,8 @@ constexpr uint64_t N_CAM_COORD      = 0x14D6F5678D8F1B37;
 constexpr uint64_t N_CAM_ROT        = 0x837765A25378F0BB;
 constexpr uint64_t N_CAM_FOV        = 0x65019750A0324133;
 
-// Indices de hueso de ped de GTA V. Si un indice no existe en el modelo, la
-// coordenada sale (0,0,0) y ese enlace se descarta solo.
+// Indices de hueso de ped de GTA V. Si el modelo no tiene el hueso, la
+// coordenada sale (0,0,0) y el enlace se descarta solo.
 enum Bone : int {
     B_Head = 0, B_Neck = 1, B_Spine3 = 2, B_Spine2 = 3, B_Spine1 = 4, B_Spine0 = 5, B_Pelvis = 6,
     B_LClav = 7, B_RClav = 8,
@@ -105,6 +99,8 @@ static const BoneLink kLinks[] = {
     { B_Pelvis, B_LThigh }, { B_LThigh, B_LCalf }, { B_LCalf, B_LFoot },
     { B_Pelvis, B_RThigh }, { B_RThigh, B_RCalf }, { B_RCalf, B_RFoot },
 };
+
+const char* g_status = "sin iniciar";
 
 uint64_t Read64(uintptr_t at) {
     uint64_t v = 0;
@@ -181,12 +177,28 @@ float AsFloat(uint64_t raw) {
     return f;
 }
 
+// Cache directa: un handler solo entra si esta en seccion ejecutable, asi que
+// un nodo corrupto no llega nunca a llamarse dos veces.
+struct HCache { uint64_t hash; Handler h; };
+HCache g_hcache[256]{};
+
+void ClearCache() { memset(g_hcache, 0, sizeof(g_hcache)); }
+
 Handler Get(uint64_t hash) {
     if (!g_table) return nullptr;
+
+    HCache& slot = g_hcache[hash & 0xFF];
+    if (slot.h && slot.hash == hash) return slot.h;
+
     uintptr_t node = reinterpret_cast<uintptr_t>(g_table[hash & 0xFF]);
     for (int guard = 0; node && guard < 64; ++guard) {
-        if (Read64(node + g_hashOff) == hash)
-            return reinterpret_cast<Handler>(Read64(node + g_handlerOff));
+        if (Read64(node + g_hashOff) == hash) {
+            Handler h = reinterpret_cast<Handler>(Read64(node + g_handlerOff));
+            if (!scanner::InExecutableSection(reinterpret_cast<uintptr_t>(h))) return nullptr;
+            slot.hash = hash;
+            slot.h = h;
+            return h;
+        }
         node = Read64(node);
     }
     return nullptr;
@@ -328,43 +340,30 @@ constexpr uint64_t kProbes[] = {
     N_INVINCIBLE, N_SUPERJUMP, N_NAME, N_CAM_COORD,
 };
 
-// Muestreo, no barrido completo: 32 cubos y 4 nodos por cubo.
-bool ProbeTable(Reg** t, int& hashOff, int& handlerOff, int& scoreOut) {
+bool ProbeTable(void** t, int& hashOff, int& handlerOff) {
     if (reinterpret_cast<uintptr_t>(t) < 0x10000) return false;
     if (!Readable(t, 256 * sizeof(void*))) return false;
 
-    int live = 0;
-    for (int i = 0; i < 256; i += 8) {
-        uintptr_t n = reinterpret_cast<uintptr_t>(t[i]);
-        if (n && Readable(reinterpret_cast<void*>(n), 24)) ++live;
-    }
-    if (live < 4) return false;
-
     static const int pairs[2][2] = { { 8, 16 }, { 16, 8 } };
-    int bestScore = 0, bestHash = 0, bestHandler = 0;
+    int best = 0, bh = 0, bhd = 0;
 
     for (auto& pr : pairs) {
-        int matched = 0, exec = 0;
+        int matched = 0;
         for (int i = 0; i < 256; ++i) {
             uintptr_t n = reinterpret_cast<uintptr_t>(t[i]);
-            for (int g = 0; n && g < 4; ++g) {
+            for (int g = 0; n && g < 6; ++g) {
                 if (!Readable(reinterpret_cast<void*>(n), 24)) break;
                 for (uint64_t probe : kProbes)
                     if (Read64(n + pr[0]) == probe) ++matched;
-                if (scanner::InExecutableSection(static_cast<uintptr_t>(Read64(n + pr[1])))) ++exec;
                 n = Read64(n);
             }
         }
-        const int s = matched * 4 + (exec > 8 ? 8 : 0);
-        if (matched >= 3 && s > bestScore) {
-            bestScore = s; bestHash = pr[0]; bestHandler = pr[1];
-        }
+        if (matched > best) { best = matched; bh = pr[0]; bhd = pr[1]; }
     }
 
-    if (!bestScore) return false;
-    hashOff = bestHash;
-    handlerOff = bestHandler;
-    scoreOut = bestScore;
+    if (best < 2) return false;
+    hashOff = bh;
+    handlerOff = bhd;
     return true;
 }
 
@@ -374,177 +373,212 @@ const Abi kAbis[] = {
     { 0x08, 0x10, 0x14, 0x18, 0x20 },
     { 0x08, 0x10, 0x14, 0x20, 0x18 },
     { 0x00, 0x10, 0x14, 0x18, 0x20 },
-    { 0x00, 0x08, 0x0C, 0x20, 0x18 },
 };
 
-bool TestAbi(const Abi& a) {
-    g_abi = a;
+// ---------------------------------------------------------------- candidatos
 
-    int me = -1;
-    __try {
-        me = static_cast<int>(Call(N_PLAYER_ID));
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-    if (me < 0 || me > 32) return false;
+struct Candidate {
+    Mode  mode;
+    void* target;
+    int   hashOff, handlerOff;
+};
 
-    int ped = 0;
-    __try {
-        ped = static_cast<int>(Call(N_GET_PLAYER_PED, me));
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-    if (ped <= 0) return false;
+std::vector<Candidate> g_cands;
 
-    Vec3 p{};
-    __try {
-        Call(N_COORDS, ped, true, &p);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-    return fabsf(p.x) > 0.5f || fabsf(p.y) > 0.5f;
+void AddInvoker(uintptr_t fn) {
+    if (!fn || !scanner::InExecutableSection(fn)) return;
+    for (auto& c : g_cands)
+        if (c.mode == MODE_INVOKER && c.target == reinterpret_cast<void*>(fn)) return;
+    if (g_cands.size() >= 16) return;
+    g_cands.push_back({ MODE_INVOKER, reinterpret_cast<void*>(fn), 0, 0 });
 }
 
-bool DetectAbi(const char* what) {
-    for (const Abi& a : kAbis) {
-        if (!TestAbi(a)) continue;
-        Log("[native] contexto valido con %s (ret+0x%X args+0x%X)", what, a.ret, a.args);
-        return true;
-    }
-    return false;
-}
+// El envoltorio hace: lea rcx,[ctx] ; mov rdx,rdi ; call <invocador>. Lo que
+// sirve es el DESTINO del call, no el envoltorio.
+void CollectInvokers() {
+    static const char* kPats[] = {
+        "48 8D 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 8B CF",
+        "48 8D 0D ? ? ? ? 48 8B D7 E8",
+        "48 8B D7 E8 ? ? ? ? 48 8B CF",
+    };
 
-uintptr_t FunctionStart(uintptr_t hit) {
-    static const uint8_t kProl[] = { 0x48, 0x89, 0x5C, 0x24, 0x08 };
+    for (auto& m : modules::All()) {
+        std::string n = m.name;
+        std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return (char)::tolower(c); });
+        if (n.find("citizen-scripting-core") == std::string::npos &&
+            n.find("gta-core-five") == std::string::npos &&
+            n.find("citizen-scripting-lua") == std::string::npos) continue;
 
-    for (int back = 1; back < 0x200; ++back) {
-        uintptr_t p = hit - back;
-        const uint8_t here = *reinterpret_cast<const uint8_t*>(p);
-        const uint8_t prev = *reinterpret_cast<const uint8_t*>(p - 1);
-
-        if (here == 0xCC && prev == 0xCC) return p + 1;
-        if (prev == 0xCC || prev == 0xC3) {
-            if (!memcmp(reinterpret_cast<const void*>(p), kProl, sizeof(kProl))) return p;
-            if (here == 0x40 && *reinterpret_cast<const uint8_t*>(p + 1) == 0x55) return p;
-            if (here == 0x48 && *reinterpret_cast<const uint8_t*>(p + 1) == 0x83 &&
-                *reinterpret_cast<const uint8_t*>(p + 2) == 0xEC) return p;
+        for (const char* pat : kPats) {
+            for (uintptr_t at : scanner::FindAll(m, pat, 4)) {
+                const size_t e8 = (pat[3] == '?') ? 10 : 3;
+                const uint8_t op = *reinterpret_cast<const uint8_t*>(at + e8);
+                if (op != 0xE8) continue;
+                const int32_t rel = *reinterpret_cast<int32_t*>(at + e8 + 1);
+                AddInvoker(at + e8 + 5 + rel);
+            }
         }
     }
-    return 0;
 }
 
-uintptr_t FindGame() {
-    ModuleInfo m = modules::Game();
-    if (!m.valid()) {
-        LogE("[native] no se encontro el modulo del juego");
-        return 0;
-    }
-    g_size = m.size;
-    return m.base;
-}
+void CollectTables() {
+    ModuleInfo game = modules::Game();
+    if (!game.valid()) return;
 
-// ---- cache del escaneo: se hace una vez y se reutiliza en cada reintento ----
-Reg**                  g_best = nullptr;
-int                    g_bestScore = 0, g_bestHash = 0, g_bestHandler = 0;
-bool                   g_scanDone = false;
-std::vector<uintptr_t> g_invokers;
+    static const char* kPats[] = {
+        "48 8B 0D ? ? ? ? 48 8B D7 E8",
+        "48 8D 0D ? ? ? ? 48 8B D7 E8",
+    };
 
-struct Pat { const char* text; bool specific; };
-static const Pat kPats[] = {
-    { "48 8D 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 8B CF", true },
-    { "48 8D 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 85 C0", true },
-    { "48 8B 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 8B CF", true },
-    { "48 8D 0D ? ? ? ? 48 8B D7 E8", false },
-    { "48 8B 0D ? ? ? ? 48 8B D7 E8", false },
-};
-
-void ScanOnce(const ModuleInfo& mod) {
-    int budget = 96;
-
-    for (const Pat& pat : kPats) {
-        auto hits = scanner::FindAll(mod, pat.text, pat.specific ? 8 : 48);
-        Log("[native] patron '%s' -> %zu coincidencias", pat.text, hits.size());
-
-        for (uintptr_t at : hits) {
-            if (--budget < 0) break;
+    for (const char* pat : kPats) {
+        for (uintptr_t at : scanner::FindAll(game, pat, 8)) {
             const int32_t rel = *reinterpret_cast<int32_t*>(at + 3);
             const uintptr_t raw = at + 7 + rel;
             if (raw < 0x10000) continue;
-
             for (int pass = 0; pass < 2; ++pass) {
-                Reg** candidate = pass ? reinterpret_cast<Reg**>(Read64(raw))
-                                       : reinterpret_cast<Reg**>(raw);
-                int h = 0, hd = 0, sc = 0;
-                if (!ProbeTable(candidate, h, hd, sc)) continue;
-                if (sc > g_bestScore) {
-                    g_bestScore = sc; g_best = candidate; g_bestHash = h; g_bestHandler = hd;
-                }
+                void** cand = pass ? reinterpret_cast<void**>(Read64(raw))
+                                   : reinterpret_cast<void**>(raw);
+                int h = 0, hd = 0;
+                if (!ProbeTable(cand, h, hd)) continue;
+                if (g_cands.size() >= 16) return;
+                g_cands.push_back({ MODE_TABLE, cand, h, hd });
+                break;
             }
         }
-        if (g_bestScore >= 24) break;
     }
-
-    if (g_best)
-        Log("[native] tabla candidata en %p (puntuacion %d, hash+0x%X handler+0x%X)",
-            static_cast<void*>(g_best), g_bestScore, g_bestHash, g_bestHandler);
-    else
-        LogE("[native] ninguna tabla candidata paso el muestreo");
-
-    for (const Pat& pat : kPats) {
-        if (!pat.specific) continue;
-        auto hits = scanner::FindAll(mod, pat.text, 8);
-        for (uintptr_t at : hits) {
-            uintptr_t start = FunctionStart(at);
-            if (!start || !scanner::InExecutableSection(start)) continue;
-            if (std::find(g_invokers.begin(), g_invokers.end(), start) != g_invokers.end()) continue;
-            if (g_invokers.size() >= 6) break;
-            g_invokers.push_back(start);
-        }
-    }
-
-    g_scanDone = true;
-    Log("[native] escaneo terminado (%zu invocadores)", g_invokers.size());
 }
 
-bool ResolveInner() {
-    g_game = FindGame();
-    if (!g_game) return false;
+void DoScan() {
+    CollectInvokers();
+    Log("[native] %zu invocadores candidatos", g_cands.size());
+    CollectTables();
+    Log("[native] %zu candidatos totales", g_cands.size());
+}
 
-    ModuleInfo mod{};
-    mod.base = g_game;
-    mod.size = g_size;
-
-    if (!g_scanDone) ScanOnce(mod);
-
-    if (g_best) {
-        g_mode = MODE_TABLE;
-        g_table = g_best;
-        g_hashOff = g_bestHash;
-        g_handlerOff = g_bestHandler;
-        if (DetectAbi("tabla")) return true;
-        g_table = nullptr;
-        LogE("[native] la tabla no paso las pruebas de contexto");
+DWORD WINAPI ScanThread(LPVOID) {
+    __try {
+        DoScan();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogE("[native] excepcion durante el escaneo");
     }
+    g_scanDone = true;
+    return 0;
+}
 
-    g_mode = MODE_INVOKER;
-    for (uintptr_t start : g_invokers) {
-        g_invoker = reinterpret_cast<Invoker>(start);
-        if (DetectAbi("invocador")) return true;
-        Sleep(40);
-    }
-    g_invoker = nullptr;
+// ------------------------------------------------------------------ validacion
 
-    LogE("[native] ni tabla ni invocador validos");
+enum PState { PS_IDLE, PS_TRY };
+PState    g_pstate = PS_IDLE;
+size_t    g_candIdx = 0;
+int       g_stage = 0;
+int       g_streak = 0;
+int       g_me = -1, g_ped = 0;
+ULONGLONG g_retryAt = 0;
+
+void Apply(const Candidate& c) {
+    g_mode = c.mode;
+    g_table = (c.mode == MODE_TABLE) ? reinterpret_cast<void**>(c.target) : nullptr;
+    g_invoker = (c.mode == MODE_INVOKER) ? reinterpret_cast<Invoker>(c.target) : nullptr;
+    g_hashOff = c.hashOff;
+    g_handlerOff = c.handlerOff;
+    ClearCache();
+}
+
+void Accept(const Candidate& c) {
+    g_nativeOk = true;
+    g_pstate = PS_IDLE;
+    g_hasScreen = (g_mode == MODE_TABLE) ? (Get(N_SCREEN) != nullptr) : false;
+    g_screenFails = 0;
+    g_status = (g_mode == MODE_INVOKER) ? "validado (invocador)" : "validado (tabla)";
+    Log("[native] VALIDADO con %s en %p", g_mode == MODE_INVOKER ? "invocador" : "tabla", c.target);
+}
+
+bool Reject(const char* why) {
+    Log("[native] candidato %zu descartado: %s", g_candIdx, why);
+    ++g_candIdx;
+    g_pstate = PS_IDLE;
+    g_stage = 0;
+    g_streak = 0;
     return false;
 }
 
-// ResolveInner usa std::vector, asi que el SEH va en un envoltorio sin objetos.
-bool Resolve() {
-    __try {
-        return ResolveInner();
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        LogE("[native] excepcion durante la resolucion, se reintenta");
-        return false;
+// Un paso por frame: nada de bloquear el render.
+bool Step() {
+    switch (g_stage) {
+    case 0: {
+        int me = -1;
+        __try { me = static_cast<int>(Call(N_PLAYER_ID)); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return Reject("PLAYER_ID lanzo"); }
+        if (me < 0 || me > 32) return Reject("PLAYER_ID fuera de rango");
+        g_me = me;
+        ++g_stage;
+        return true;
+    }
+    case 1: {
+        // PLAYER_PED_ID y GET_PLAYER_PED(PLAYER_ID) tienen que coincidir.
+        int a = 0, b = 0;
+        __try {
+            a = static_cast<int>(Call(N_PLAYER_PED_ID));
+            b = static_cast<int>(Call(N_GET_PLAYER_PED, g_me));
+        } __except (EXCEPTION_EXECUTE_HANDLER) { return Reject("ped lanzo"); }
+        if (a <= 0 || a != b) return Reject("ped inconsistente");
+        g_ped = a;
+        ++g_stage;
+        return true;
+    }
+    case 2: {
+        Vec3 p{};
+        int act = 0, hp = 0;
+        __try {
+            act = static_cast<int>(Call(N_ACTIVE, g_me));
+            Call(N_COORDS, g_ped, true, &p);
+            hp = static_cast<int>(Call(N_HEALTH, g_ped));
+        } __except (EXCEPTION_EXECUTE_HANDLER) { return Reject("coords/salud lanzaron"); }
+        if (!act) return Reject("jugador inactivo");
+        if (fabsf(p.x) > 20000.0f || fabsf(p.y) > 20000.0f || fabsf(p.z) > 8000.0f)
+            return Reject("coords fuera del mundo");
+        if (p.x == 0.0f && p.y == 0.0f) return Reject("coords a cero");
+        if (hp <= 0 || hp > 2000) return Reject("salud absurda");
+        ++g_stage;
+        return true;
+    }
+    default: {
+        if (++g_streak >= 3) { Accept(g_cands[g_candIdx]); return true; }
+        return true;
+    }
+    }
+}
+
+void Pump() {
+    if (g_nativeOk || !g_scanDone) return;
+
+    const ULONGLONG now = GetTickCount64();
+    if (now < g_retryAt) return;
+
+    if (g_cands.empty()) {
+        g_status = "sin candidatos";
+        g_retryAt = now + 2000;
+        return;
+    }
+
+    if (g_pstate == PS_IDLE) {
+        if (g_candIdx >= g_cands.size()) {
+            g_candIdx = 0;
+            g_status = "sin candidato valido, reintentando";
+            g_retryAt = now + 3000;
+            return;
+        }
+        Apply(g_cands[g_candIdx]);
+        g_stage = 0;
+        g_streak = 0;
+        g_pstate = PS_TRY;
+        return;
+    }
+
+    for (const Abi& a : kAbis) {
+        g_abi = a;
+        if (Step()) return;
+        if (g_pstate == PS_IDLE) return;
     }
 }
 } // namespace
@@ -553,138 +587,130 @@ namespace native {
 
 bool ready() { return g_nativeOk; }
 bool usingMatrix() { return !g_hasScreen; }
+const char* statusText() { return g_status; }
 
-bool esp()      { return g_esp; }
-bool box()      { return g_box; }
-bool aim()      { return g_aim; }
-bool god()      { return g_god; }
-bool jump()     { return g_jump; }
-bool skel()     { return g_skel; }
-bool aimHold()  { return g_aimHold; }
-float fov()     { return g_fov; }
-float smooth()  { return g_smooth; }
+bool esp()     { return g_esp; }
+bool box()     { return g_box; }
+bool aim()     { return g_aim; }
+bool god()     { return g_god; }
+bool jump()    { return g_jump; }
+bool skel()    { return g_skel; }
+bool aimHold() { return g_aimHold; }
+float fov()    { return g_fov; }
+float smooth() { return g_smooth; }
 
-void setEsp(bool v)      { g_esp = v; }
-void setBox(bool v)      { g_box = v; }
-void setAim(bool v)      { g_aim = v; }
-void setGod(bool v)      { g_god = v; }
-void setJump(bool v)     { g_jump = v; }
-void setSkel(bool v)     { g_skel = v; }
-void setAimHold(bool v)  { g_aimHold = v; }
-void setFov(float v)     { g_fov = v; }
-void setSmooth(float v)  { g_smooth = v; }
+void setEsp(bool v)     { g_esp = v; }
+void setBox(bool v)     { g_box = v; }
+void setAim(bool v)     { g_aim = v; }
+void setGod(bool v)     { g_god = v; }
+void setJump(bool v)    { g_jump = v; }
+void setSkel(bool v)    { g_skel = v; }
+void setAimHold(bool v) { g_aimHold = v; }
+void setFov(float v)    { g_fov = v; }
+void setSmooth(float v) { g_smooth = v; }
 
 void rearm() {
-    if (g_nativeOk || g_resolving) return;
-    g_scanDone = false;
-    g_best = nullptr;
-    g_bestScore = 0;
-    g_invokers.clear();
+    if (g_nativeOk) return;
+    g_candIdx = 0;
+    g_pstate = PS_IDLE;
+    g_retryAt = 0;
+    g_status = "rearme manual";
     Log("rearme de resolucion solicitado");
 }
 
 bool init() {
     if (g_nativeOk) return true;
-
-    bool expected = false;
-    if (!g_resolving.compare_exchange_strong(expected, true)) return false;
-
-    const bool ok = Resolve();
-    if (ok) {
-        g_hasScreen = (g_mode == MODE_TABLE) ? (Get(N_SCREEN) != nullptr) : false;
-        g_screenFails = 0;
-        g_nativeOk = true;
-        Log("[native] listo (modo %s, pantalla %s)", g_mode == MODE_INVOKER ? "invocador" : "tabla",
-            g_hasScreen ? "native" : "matriz");
-    } else {
-        g_table = nullptr;
-        g_invoker = nullptr;
+    if (!g_scanStarted.exchange(true)) {
+        g_status = "escaneando";
+        CloseHandle(CreateThread(nullptr, 0, ScanThread, nullptr, 0, nullptr));
     }
-
-    g_resolving = false;
-    return ok;
+    return g_nativeOk;
 }
 
 void shutdown() {
     g_table = nullptr;
     g_invoker = nullptr;
     g_nativeOk = false;
+    ClearCache();
 }
 
 void tick() {
+    Pump();
     if (!ready()) return;
     ++g_ticks;
 
     if (!g_god && !g_jump && !g_aim) return;
 
-    const int me = static_cast<int>(Call(N_PLAYER_ID));
-    if (me < 0 || me > 32) return;
+    __try {
+        const int me = static_cast<int>(Call(N_PLAYER_ID));
+        if (me < 0 || me > 32) return;
 
-    if (g_god)  Call(N_INVINCIBLE, me, true);
-    if (g_jump) Call(N_SUPERJUMP, me);
+        if (g_god)  Call(N_INVINCIBLE, me, true);
+        if (g_jump) Call(N_SUPERJUMP, me);
 
-    if (!g_aim) return;
-    if (g_aimHold && !(GetAsyncKeyState(VK_RBUTTON) & 0x8000)) return;
+        if (!g_aim) return;
+        if (g_aimHold && !(GetAsyncKeyState(VK_RBUTTON) & 0x8000)) return;
 
-    const int selfPed = static_cast<int>(Call(N_PLAYER_PED_ID));
-    if (!selfPed) return;
-    const Vec3 self = Coords(selfPed);
-    if (self.x == 0.0f && self.y == 0.0f) return;
+        const int selfPed = static_cast<int>(Call(N_PLAYER_PED_ID));
+        if (!selfPed) return;
+        const Vec3 self = Coords(selfPed);
+        if (self.x == 0.0f && self.y == 0.0f) return;
 
-    const ImVec2 disp = ImGui::GetIO().DisplaySize;
-    if (disp.x < 16.0f) return;
-    const float cx = disp.x * 0.5f, cy = disp.y * 0.5f;
+        const ImVec2 disp = ImGui::GetIO().DisplaySize;
+        if (disp.x < 16.0f) return;
+        const float cx = disp.x * 0.5f, cy = disp.y * 0.5f;
 
-    int best = 0;
-    float bestD = g_fov;
-    Vec3 bestPos{};
+        int best = 0;
+        float bestD = g_fov;
+        Vec3 bestPos{};
 
-    for (int i = 0; i < 32; ++i) {
-        if (i == me || !Call(N_ACTIVE, i)) continue;
-        const int ped = static_cast<int>(Call(N_GET_PLAYER_PED, i));
-        if (!ped) continue;
+        for (int i = 0; i < 32; ++i) {
+            if (i == me || !Call(N_ACTIVE, i)) continue;
+            const int ped = static_cast<int>(Call(N_GET_PLAYER_PED, i));
+            if (!ped) continue;
 
-        const Vec3 pos = Coords(ped);
-        const float dxw = pos.x - self.x, dyw = pos.y - self.y, dzw = pos.z - self.z;
-        if (dxw * dxw + dyw * dyw + dzw * dzw > kAimDist * kAimDist) continue;
+            const Vec3 pos = Coords(ped);
+            const float dxw = pos.x - self.x, dyw = pos.y - self.y, dzw = pos.z - self.z;
+            if (dxw * dxw + dyw * dyw + dzw * dzw > kAimDist * kAimDist) continue;
 
-        float sx, sy;
-        if (!W2S(pos, sx, sy)) continue;
-        const float dx = sx - cx, dy = sy - cy;
-        const float d = sqrtf(dx * dx + dy * dy);
-        if (d < bestD) { bestD = d; best = ped; bestPos = pos; }
+            float sx, sy;
+            if (!W2S(pos, sx, sy)) continue;
+            const float dx = sx - cx, dy = sy - cy;
+            const float d = sqrtf(dx * dx + dy * dy);
+            if (d < bestD) { bestD = d; best = ped; bestPos = pos; }
+        }
+        if (!best) return;
+
+        const float dx = bestPos.x - self.x, dy = bestPos.y - self.y, dz = bestPos.z - self.z;
+        const float horiz = sqrtf(dx * dx + dy * dy);
+        if (horiz < 0.1f) return;
+
+        const float bearing = atan2f(dx, dy) * 57.29578f;
+        const float heading = AsFloat(Call(N_HEADING, selfPed));
+        const float pitch = -atan2f(dz, horiz) * 57.29578f;
+
+        static float s_relH = 0.0f, s_relP = 0.0f;
+        static int   s_lastTarget = 0;
+
+        float relH = bearing - heading;
+        while (relH > 180.0f)  relH -= 360.0f;
+        while (relH < -180.0f) relH += 360.0f;
+
+        if (best != s_lastTarget || fabsf(relH - s_relH) > 60.0f) {
+            s_relH = relH;
+            s_relP = pitch;
+            s_lastTarget = best;
+        } else {
+            const float k = g_smooth;
+            s_relH += (relH - s_relH) * k;
+            s_relP += (pitch - s_relP) * k;
+        }
+
+        Call(N_CAM_HEADING, s_relH);
+        Call(N_CAM_PITCH, s_relP, 1.0f);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogE("[native] excepcion en tick, frame saltado");
     }
-    if (!best) return;
-
-    const float dx = bestPos.x - self.x, dy = bestPos.y - self.y, dz = bestPos.z - self.z;
-    const float horiz = sqrtf(dx * dx + dy * dy);
-    if (horiz < 0.1f) return;
-
-    const float bearing = atan2f(dx, dy) * 57.29578f;
-    const float heading = AsFloat(Call(N_HEADING, selfPed));
-    const float pitch = -atan2f(dz, horiz) * 57.29578f;
-
-    // El objetivo se recalcula cada frame, asi que se suaviza el valor relativo
-    // (que ya es pequeno) y se reinicia si el salto es grande.
-    static float s_relH = 0.0f, s_relP = 0.0f;
-    static int   s_lastTarget = 0;
-
-    float relH = bearing - heading;
-    while (relH > 180.0f)  relH -= 360.0f;
-    while (relH < -180.0f) relH += 360.0f;
-
-    if (best != s_lastTarget || fabsf(relH - s_relH) > 60.0f) {
-        s_relH = relH;
-        s_relP = pitch;
-        s_lastTarget = best;
-    } else {
-        const float k = g_smooth;
-        s_relH += (relH - s_relH) * k;
-        s_relP += (pitch - s_relP) * k;
-    }
-
-    Call(N_CAM_HEADING, s_relH);
-    Call(N_CAM_PITCH, s_relP, 1.0f);
 }
 
 const char* NameOf(int i, int ped, ULONGLONG now) {
@@ -731,62 +757,64 @@ void render() {
     if (!ImGui::GetCurrentContext()) return;
     if (g_ticks & 1) return;
 
-    const int me = static_cast<int>(Call(N_PLAYER_ID));
-    const int selfPed = static_cast<int>(Call(N_PLAYER_PED_ID));
-    if (!selfPed) return;
-    const Vec3 self = Coords(selfPed);
+    __try {
+        const int me = static_cast<int>(Call(N_PLAYER_ID));
+        const int selfPed = static_cast<int>(Call(N_PLAYER_PED_ID));
+        if (!selfPed) return;
+        const Vec3 self = Coords(selfPed);
 
-    ImDrawList* dl = ImGui::GetBackgroundDrawList();
-    if (!dl) return;
+        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+        if (!dl) return;
 
-    const ULONGLONG now = GetTickCount64();
+        const ULONGLONG now = GetTickCount64();
 
-    for (int i = 0; i < 32; ++i) {
-        if (i == me || !Call(N_ACTIVE, i)) continue;
-        const int ped = static_cast<int>(Call(N_GET_PLAYER_PED, i));
-        if (!ped) continue;
+        for (int i = 0; i < 32; ++i) {
+            if (i == me || !Call(N_ACTIVE, i)) continue;
+            const int ped = static_cast<int>(Call(N_GET_PLAYER_PED, i));
+            if (!ped) continue;
 
-        const Vec3 feet = Coords(ped);
-        const float ddx = feet.x - self.x, ddy = feet.y - self.y, ddz = feet.z - self.z;
-        const float dist = sqrtf(ddx * ddx + ddy * ddy + ddz * ddz);
-        if (dist > kMaxDist) continue;
+            const Vec3 feet = Coords(ped);
+            const float ddx = feet.x - self.x, ddy = feet.y - self.y, ddz = feet.z - self.z;
+            const float dist = sqrtf(ddx * ddx + ddy * ddy + ddz * ddz);
+            if (dist > kMaxDist) continue;
 
-        // La caja se ancla al hueso de la cabeza cuando existe: con peds
-        // agachados o en vehiculo el offset fijo flotaba.
-        Vec3 head = Bone(ped, B_Head);
-        const bool realHead = !(head.x == 0.0f && head.y == 0.0f && head.z == 0.0f);
-        if (!realHead) { head = feet; head.z += 1.85f; }
+            Vec3 head = Bone(ped, B_Head);
+            const bool realHead = !(head.x == 0.0f && head.y == 0.0f && head.z == 0.0f);
+            if (!realHead) { head = feet; head.z += 1.85f; }
 
-        float fx, fy, hx, hy;
-        if (!W2S(feet, fx, fy)) continue;
-        if (!W2S(head, hx, hy)) continue;
+            float fx, fy, hx, hy;
+            if (!W2S(feet, fx, fy)) continue;
+            if (!W2S(head, hx, hy)) continue;
 
-        float boxH = fabsf(fy - hy);
-        if (boxH < 8.0f) boxH = 8.0f;
-        if (boxH > 900.0f) boxH = 900.0f;
-        const float boxW = boxH * 0.42f;
+            float boxH = fabsf(fy - hy);
+            if (boxH < 8.0f) boxH = 8.0f;
+            if (boxH > 900.0f) boxH = 900.0f;
+            const float boxW = boxH * 0.42f;
 
-        if (g_box) {
-            dl->AddRect(ImVec2(hx - boxW * 0.5f, hy), ImVec2(hx + boxW * 0.5f, fy),
-                        IM_COL32(0, 255, 128, 200), 0.0f, 0, 1.5f);
+            if (g_box) {
+                dl->AddRect(ImVec2(hx - boxW * 0.5f, hy), ImVec2(hx + boxW * 0.5f, fy),
+                            IM_COL32(0, 255, 128, 200), 0.0f, 0, 1.5f);
+            }
+
+            if (g_skel && dist <= kSkelDist) DrawSkeleton(dl, ped);
+
+            if (g_esp) {
+                const char* name = NameOf(i, ped, now);
+                const int hp = static_cast<int>(Call(N_HEALTH, ped));
+                char label[160]{};
+                snprintf(label, sizeof(label), "%s\n%d hp\n%.0f m",
+                         (name && name[0]) ? name : "jugador", hp, dist);
+                dl->AddText(ImVec2(hx + boxW * 0.55f, hy), IM_COL32(0, 255, 128, 255), label);
+            }
         }
-
-        if (g_skel && dist <= kSkelDist) DrawSkeleton(dl, ped);
-
-        if (g_esp) {
-            const char* name = NameOf(i, ped, now);
-            const int hp = static_cast<int>(Call(N_HEALTH, ped));
-            char label[160]{};
-            snprintf(label, sizeof(label), "%s\n%d hp\n%.0f m",
-                     (name && name[0]) ? name : "jugador", hp, dist);
-            dl->AddText(ImVec2(hx + boxW * 0.55f, hy), IM_COL32(0, 255, 128, 255), label);
-        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogE("[native] excepcion en render, frame saltado");
     }
 }
 
 void renderMenu() {
     if (!ready()) {
-        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "natives no resueltos, revisa el log");
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "natives: %s", g_status);
         ImGui::Separator();
     }
 

@@ -115,9 +115,6 @@ static bool SelfImportsRuntime() {
     return false;
 }
 
-// dbghelp se carga con LoadLibrary y no por import: el manual map resuelve los
-// imports contra el proceso del inyector y las direcciones de una DLL con ASLR
-// no coinciden entre procesos.
 using MiniDumpWriteDump_t = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, DWORD, void*, void*, void*);
 
 static void WriteDump(EXCEPTION_POINTERS* ep) {
@@ -181,20 +178,6 @@ static DWORD WINAPI UnloadThread(LPVOID) {
     return 0;
 }
 
-// Los natives se resuelven aparte y con reintentos: al inyectar el jugador
-// puede seguir en carga y PLAYER_ID todavia no devuelve nada valido.
-static DWORD WINAPI NativeThread(LPVOID) {
-    for (int attempt = 0; attempt < 120; ++attempt) {
-        if (native::ready()) return 0;
-        if (native::init()) { BootMark("natives ok"); return 0; }
-        if (attempt == 0) BootMark("natives primer intento fallido");
-        Sleep(attempt < 10 ? 2000 : 5000);
-    }
-    BootMark("natives agotado");
-    LogE("[core] natives sin resolver tras 120 intentos");
-    return 0;
-}
-
 // Lua y el hook de loadbufferx escanean todos los modulos: fuera del hilo de arranque.
 static DWORD WINAPI LuaThread(LPVOID) {
     bool ok = false;
@@ -254,7 +237,8 @@ static DWORD WINAPI Init(LPVOID) {
     }
     BootMark(armed ? "overlay armado" : "overlay fallo");
 
-    if (window) CloseHandle(CreateThread(nullptr, 0, NativeThread, nullptr, 0, nullptr));
+    // El escaneo corre en su propio hilo; la validacion la hace el render.
+    if (window) Stage("native_scan", [] { native::init(); });
     if (mhook)  CloseHandle(CreateThread(nullptr, 0, LuaThread, nullptr, 0, nullptr));
 
     BootMark("listo");

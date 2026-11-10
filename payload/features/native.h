@@ -4,6 +4,7 @@ namespace native {
 
 bool ready();
 bool usingMatrix();
+const char* statusText();
 
 bool esp();
 bool box();

@@ -348,7 +348,6 @@ HRESULT PrepareAndDraw(IDXGISwapChain* swap, bool& drew) {
     drew = false;
 
     if (!g_ready) {
-        // Reintento con espaciado: si falla no se crea/destruye ImGui cada frame.
         const ULONGLONG now = GetTickCount64();
         if (now < g_nextSetupAt) return S_OK;
         if (!Setup(swap)) {
@@ -378,7 +377,9 @@ HRESULT PrepareAndDraw(IDXGISwapChain* swap, bool& drew) {
     }
 
     PollKeys();
-    if (native::ready()) native::tick();
+
+    // Siempre: tick avanza la validacion de natives un paso por frame.
+    native::tick();
 
     if (!g_visible && g_autoShowAt && GetTickCount64() > g_autoShowAt) {
         g_autoShowAt = 0;
@@ -406,7 +407,6 @@ HRESULT __stdcall hkResize(IDXGISwapChain* swap, UINT a, UINT b, UINT c, DXGI_FO
     if (!o_resize) return E_FAIL;
     if (g_shuttingDown || !g_ready) return o_resize(swap, a, b, c, d, e);
 
-    // Todas las referencias al backbuffer tienen que soltarse antes del resize.
     ReleaseRtv();
     if (ImGui::GetCurrentContext()) ImGui_ImplDX11_InvalidateDeviceObjects();
 
@@ -494,10 +494,8 @@ void** GrabVtable() {
     desc.OutputWindow = host;
     desc.SampleDesc.Count = 1;
     desc.Windowed = TRUE;
-    // FLIP_DISCARD: es el modelo que usa FiveM/GTA. Con DISCARD la vtable que
-    // se obtiene puede no ser la misma clase que la del juego. Ademas con FLIP
-    // el objeto es un IDXGISwapChain1, asi que el indice 22 (Present1) existe
-    // de verdad en la vtable.
+    // FLIP_DISCARD: es el modelo que usa FiveM/GTA. Con FLIP el objeto es un
+    // IDXGISwapChain1, asi que el indice 22 (Present1) existe de verdad.
     desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
     ID3D11Device* device = nullptr;
@@ -540,7 +538,6 @@ bool CreateSwapChainHook() {
                                 reinterpret_cast<void**>(&o_present));
     const bool okR  = PatchSlot(g_vtable, 13, reinterpret_cast<void*>(&hkResize),
                                 reinterpret_cast<void**>(&o_resize));
-    // Present1 (indice 22) solo existe si la vtable es de IDXGISwapChain1+.
     const bool okP1 = (g_vtable[22] && g_vtable[22] != g_vtable[8])
                         ? PatchSlot(g_vtable, 22, reinterpret_cast<void*>(&hkPresent1),
                                     reinterpret_cast<void**>(&o_present1))

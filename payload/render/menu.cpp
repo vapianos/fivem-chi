@@ -42,7 +42,7 @@ static void BootLogTail() {
 }
 
 void Render() {
-    ImGui::SetNextWindowSize(ImVec2(460.0f, 420.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(470.0f, 440.0f), ImGuiCond_FirstUseEver);
 
     if (!ImGui::Begin("Venice", nullptr, ImGuiWindowFlags_NoCollapse)) {
         ImGui::End();
@@ -82,6 +82,7 @@ void Render() {
 
         if (ImGui::BeginTabItem("Estado")) {
             ImGui::Text("natives: %s", native::ready() ? "ok" : "no");
+            ImGui::Text("detalle: %s", native::statusText());
             ImGui::Text("proyeccion: %s", native::usingMatrix() ? "matriz" : "native");
             ImGui::Text("overlay: %s", overlay::armed() ? "armado" : "sin armar");
             ImGui::Separator();
