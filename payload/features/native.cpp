@@ -205,20 +205,35 @@ bool W2S(const Vec3& w, float& sx, float& sy) {
     return W2SMatrix(w, sx, sy);
 }
 
-bool ValidTable(Reg** t) {
+constexpr uint64_t kProbes[] = {
+    N_PLAYER_PED_ID, N_PLAYER_ID, N_COORDS, N_HEALTH,
+    N_INVINCIBLE, N_SUPERJUMP, N_NAME, N_CAM_COORD,
+};
+
+// Puntua cuantos hashes conocidos aparecen con handler ejecutable. Exigir los
+// tres primeros y descartar el resto rechaza las 8 coincidencias de 3889.
+int ScoreTable(Reg** t) {
+    if (reinterpret_cast<uintptr_t>(t) < 0x10000) return 0;
+
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(t, &mbi, sizeof(mbi))) return 0;
+    if (mbi.State != MEM_COMMIT) return 0;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+
+    int score = 0;
     __try {
-        if (reinterpret_cast<uintptr_t>(t) < 0x10000) return false;
-        const uint64_t probe[3] = { N_PLAYER_PED_ID, N_PLAYER_ID, N_COORDS };
-        for (int p = 0; p < 3; ++p) {
-            Reg* r = t[probe[p] & 0xFF];
-            for (int guard = 0; r && guard < 64; ++guard, r = r->next)
-                if (r->hash == probe[p])
-                    return scanner::InExecutableSection(reinterpret_cast<uintptr_t>(r->handler));
+        for (uint64_t probe : kProbes) {
+            Reg* r = t[probe & 0xFF];
+            for (int g = 0; r && g < 32; ++g, r = r->next) {
+                if (r->hash != probe) continue;
+                if (scanner::InExecutableSection(reinterpret_cast<uintptr_t>(r->handler))) ++score;
+                break;
+            }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
+        return 0;
     }
-    return false;
+    return score;
 }
 
 uintptr_t FindGame() {
@@ -239,28 +254,46 @@ bool Resolve() {
     mod.base = g_game;
     mod.size = g_size;
 
-    const char* patterns[] = {
-        "48 8D 0D ? ? ? ? 48 8B D7 E8",
-        "48 8D 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 8B CF",
-        "48 8B 0D ? ? ? ? 48 8B D7 E8",
-        "48 8B 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 8B CF",
+    // 48 8D 0D = lea rcx,[rip+x]: la tabla se usa directa.
+    // 48 8B 0D = mov rcx,[rip+x]: el global guarda el puntero, hay que
+    // desreferenciar. Las dos formas aparecen segun el build.
+    struct Pat { const char* text; bool indirect; };
+    static const Pat pats[] = {
+        { "48 8D 0D ? ? ? ? 48 8B D7 E8", false },
+        { "48 8D 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 8B CF", false },
+        { "48 8D 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 85 C0", false },
+        { "48 8B 0D ? ? ? ? 48 8B D7 E8", true },
+        { "48 8B 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 8B CF", true },
     };
 
-    for (const char* pat : patterns) {
-        auto hits = scanner::FindAll(mod, pat, 8);
-        Log("[native] patron '%s' -> %zu coincidencias", pat, hits.size());
+    Reg** best = nullptr;
+    int   bestScore = 0;
+
+    for (const Pat& pat : pats) {
+        auto hits = scanner::FindAll(mod, pat.text, 64);
+        Log("[native] patron '%s' -> %zu coincidencias", pat.text, hits.size());
+
         for (uintptr_t at : hits) {
             const int32_t rel = *reinterpret_cast<int32_t*>(at + 3);
-            auto* candidate = reinterpret_cast<Reg**>(at + 7 + rel);
-            if (!ValidTable(candidate)) continue;
-            g_table = candidate;
-            Log("[native] tabla validada en %p", static_cast<void*>(g_table));
-            return true;
+            auto* slot = reinterpret_cast<Reg***>(at + 7 + rel);
+            auto* candidate = pat.indirect ? reinterpret_cast<Reg**>(*slot)
+                                           : reinterpret_cast<Reg**>(slot);
+            if (reinterpret_cast<uintptr_t>(candidate) < 0x10000) continue;
+
+            const int score = ScoreTable(candidate);
+            if (score > bestScore) { bestScore = score; best = candidate; }
         }
     }
 
-    LogE("[native] tabla de natives no resuelta");
-    return false;
+    if (!best || bestScore < 3) {
+        LogE("[native] tabla de natives no resuelta (mejor puntuacion %d)", bestScore);
+        return false;
+    }
+
+    g_table = best;
+    Log("[native] tabla validada en %p (puntuacion %d/%zu)", static_cast<void*>(g_table),
+        bestScore, sizeof(kProbes) / sizeof(kProbes[0]));
+    return true;
 }
 } // namespace
 

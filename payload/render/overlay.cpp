@@ -335,6 +335,9 @@ void DrawFrame() {
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 }
 
+HRESULT __stdcall hkPresent(IDXGISwapChain* swap, UINT sync, UINT flags);
+HRESULT __stdcall hkPresent1(IDXGISwapChain1* swap, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* p);
+
 HRESULT PrepareAndDraw(IDXGISwapChain* swap, bool& drew) {
     drew = false;
 
@@ -347,13 +350,15 @@ HRESULT PrepareAndDraw(IDXGISwapChain* swap, bool& drew) {
     ++g_frames;
 
     if (g_armed && g_frames % 120 == 0) {
-        void* cur = g_vtable[8];
-        if (cur != reinterpret_cast<void*>(&o_present)) {
-            if (cur) o_present = reinterpret_cast<Present_t>(cur);
-            PatchSlot(g_vtable, 8, reinterpret_cast<void*>(nullptr), nullptr);
-            g_vtable[8] = reinterpret_cast<void*>(+[](IDXGISwapChain* s, UINT a, UINT b) -> HRESULT {
-                return s->Present(a, b);
-            });
+        // Re-enganche con las funciones reales, nunca con lambdas: una llamada
+        // swap->Present() vuelve a pasar por vtable[8] y se queda en bucle.
+        if (g_vtable[8] != reinterpret_cast<void*>(&hkPresent)) {
+            if (g_vtable[8]) o_present = reinterpret_cast<Present_t>(g_vtable[8]);
+            PatchSlot(g_vtable, 8, reinterpret_cast<void*>(&hkPresent), nullptr);
+        }
+        if (o_present1 && g_vtable[22] != reinterpret_cast<void*>(&hkPresent1)) {
+            if (g_vtable[22]) o_present1 = reinterpret_cast<Present1_t>(g_vtable[22]);
+            PatchSlot(g_vtable, 22, reinterpret_cast<void*>(&hkPresent1), nullptr);
         }
         if (g_hwnd && o_wndproc &&
             GetWindowLongPtrW(g_hwnd, GWLP_WNDPROC) != reinterpret_cast<LONG_PTR>(hkWndProc))
@@ -408,7 +413,8 @@ void OnDeviceLost(HRESULT hr) {
 }
 
 HRESULT __stdcall hkPresent(IDXGISwapChain* swap, UINT sync, UINT flags) {
-    if (g_shuttingDown || g_inPresent || !o_present) return o_present(swap, sync, flags);
+    if (!o_present) return S_OK;
+    if (g_shuttingDown || g_inPresent) return o_present(swap, sync, flags);
 
     g_inPresent = true;
     bool drew = false;
@@ -423,8 +429,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* swap, UINT sync, UINT flags) {
             LogE("excepcion dentro de Present (total %d)", g_faults);
     }
 
-    if (!drew) hr = o_present(swap, sync, flags);
-    else if (hr == S_OK) hr = o_present(swap, sync, flags);
+    if (!drew || hr == S_OK) hr = o_present(swap, sync, flags);
 
     g_inPresent = false;
 
@@ -433,7 +438,8 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* swap, UINT sync, UINT flags) {
 }
 
 HRESULT __stdcall hkPresent1(IDXGISwapChain1* swap, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* p) {
-    if (g_shuttingDown || g_inPresent || !o_present1) return o_present1(swap, sync, flags, p);
+    if (!o_present1) return S_OK;
+    if (g_shuttingDown || g_inPresent) return o_present1(swap, sync, flags, p);
 
     g_inPresent = true;
     bool drew = false;

@@ -5,6 +5,7 @@
 #include "utils/paths.h"
 
 #include <Windows.h>
+#include <cstring>
 #include <mutex>
 #include <vector>
 #include <utility>
@@ -30,12 +31,17 @@ using lua_gettop_t       = int  (*)(lua_State*);
 using lua_settop_t       = void (*)(lua_State*, int);
 using lua_type_t         = int  (*)(lua_State*, int);
 
+// Lua 5.4: lua_setglobal(L, k) es exactamente lua_setfield(L, LUA_GLOBALSINDEX, k).
+// -1001002 es LUA_GLOBALSINDEX con LUAI_MAXSTACK por defecto, asi el globals se
+// toca con setfield y no dependemos de firmas que cambian entre builds.
+constexpr int kGlobalsIndex = -1001002;
+
 struct LuaApi {
     lua_loadbufferx_t  loadbufferx = nullptr;
     lua_pcallk_t       pcallk      = nullptr;
     lua_pushstring_t   pushstring  = nullptr;
-    lua_setglobal_t    setglobal   = nullptr;
-    lua_getglobal_t    getglobal   = nullptr;
+    lua_setglobal_t    setglobal   = nullptr;   // opcional, no se usa
+    lua_getglobal_t    getglobal   = nullptr;   // opcional, no se usa
     lua_createtable_t  createtable = nullptr;
     lua_setfield_t     setfield    = nullptr;
     lua_pushcclosure_t pushcclosure = nullptr;
@@ -47,8 +53,9 @@ struct LuaApi {
     lua_settop_t       settop      = nullptr;
     lua_type_t         type        = nullptr;
 
+    // setglobal/getglobal quedan fuera: en 3889 sus firmas no existen.
     bool ok() const {
-        return loadbufferx && pcallk && pushstring && setglobal && getglobal &&
+        return loadbufferx && pcallk && pushstring &&
                createtable && setfield && pushcclosure && tolstring &&
                pushinteger && pushboolean && pushnil && gettop && settop && type;
     }
@@ -58,6 +65,7 @@ struct Sig {
     const char* name;
     const char* pattern;
     void** slot;
+    bool optional;
 };
 
 LuaApi            g_api;
@@ -105,34 +113,33 @@ uintptr_t FindAnywhere(const char* pattern) {
 
 bool Resolve() {
     static const Sig sigs[] = {
-        { "luaL_loadbufferx", "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 30", (void**)&g_api.loadbufferx },
-        { "lua_pcallk",       "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83 EC 20", (void**)&g_api.pcallk },
-        { "lua_pushstring",   "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B D9 48 85 D2 75", (void**)&g_api.pushstring },
-        { "lua_setglobal",    "48 89 5C 24 08 57 48 83 EC 20 48 8B D9 48 85 D2 75 08 48 8B 05", (void**)&g_api.setglobal },
-        { "lua_getglobal",    "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B D9 48 85 D2 75 08 48 8B 05", (void**)&g_api.getglobal },
-        { "lua_createtable",  "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B F1 48 8B D9 48 63 FA 48 85 D2 7F", (void**)&g_api.createtable },
-        { "lua_setfield",     "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B D9 48 85 D2 74 1E 48 8B F2", (void**)&g_api.setfield },
-        { "lua_pushcclosure", "48 89 5C 24 08 48 89 74 24 10 48 89 7C 24 18 41 56 48 83 EC 20 48 8B D9 48 8B FA 48 63 F1", (void**)&g_api.pushcclosure },
-        { "lua_tolstring",    "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 30 48 8B E9", (void**)&g_api.tolstring },
-        { "lua_pushinteger",  "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B D9 48 8B F2 48 85 D2", (void**)&g_api.pushinteger },
-        { "lua_pushboolean",  "48 89 5C 24 08 57 48 83 EC 20 48 8B D9 8B FA 85 D2 74 04", (void**)&g_api.pushboolean },
-        { "lua_pushnil",      "48 89 5C 24 08 57 48 83 EC 20 48 8B D9 48 8B 49 10 48 8B 41 08", (void**)&g_api.pushnil },
-        { "lua_gettop",       "48 8B 41 10 48 2B 41 08 48 C1 F8 04 C3", (void**)&g_api.gettop },
-        { "lua_settop",       "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B F1 48 8B DA 85 D2 78 12", (void**)&g_api.settop },
-        { "lua_type",         "48 89 5C 24 08 57 48 83 EC 20 48 8B D9 48 63 FA 48 85 D2 7F 0D", (void**)&g_api.type },
+        { "luaL_loadbufferx", "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 30", (void**)&g_api.loadbufferx, false },
+        { "lua_pcallk",       "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83 EC 20", (void**)&g_api.pcallk, false },
+        { "lua_pushstring",   "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B D9 48 85 D2 75", (void**)&g_api.pushstring, false },
+        { "lua_createtable",  "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B F1 48 8B D9 48 63 FA 48 85 D2 7F", (void**)&g_api.createtable, false },
+        { "lua_setfield",     "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B D9 48 85 D2 74 1E 48 8B F2", (void**)&g_api.setfield, false },
+        { "lua_pushcclosure", "48 89 5C 24 08 48 89 74 24 10 48 89 7C 24 18 41 56 48 83 EC 20 48 8B D9 48 8B FA 48 63 F1", (void**)&g_api.pushcclosure, false },
+        { "lua_tolstring",    "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 30 48 8B E9", (void**)&g_api.tolstring, false },
+        { "lua_pushinteger",  "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B D9 48 8B F2 48 85 D2", (void**)&g_api.pushinteger, false },
+        { "lua_pushboolean",  "48 89 5C 24 08 57 48 83 EC 20 48 8B D9 8B FA 85 D2 74 04", (void**)&g_api.pushboolean, false },
+        { "lua_pushnil",      "48 89 5C 24 08 57 48 83 EC 20 48 8B D9 48 8B 49 10 48 8B 41 08", (void**)&g_api.pushnil, false },
+        { "lua_gettop",       "48 8B 41 10 48 2B 41 08 48 C1 F8 04 C3", (void**)&g_api.gettop, false },
+        { "lua_settop",       "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B F1 48 8B DA 85 D2 78 12", (void**)&g_api.settop, false },
+        { "lua_type",         "48 89 5C 24 08 57 48 83 EC 20 48 8B D9 48 63 FA 48 85 D2 7F 0D", (void**)&g_api.type, false },
+        { "lua_setglobal",    "4C 8B C2 BA D6 B4 F0 FF E9", (void**)&g_api.setglobal, true },
+        { "lua_getglobal",    "4C 8B C2 BA D6 B4 F0 FF E9", (void**)&g_api.getglobal, true },
     };
 
-    bool all = true;
     for (auto& sig : sigs) {
         uintptr_t hit = FindAnywhere(sig.pattern);
         if (!hit) {
-            LogE("firma no encontrada: %s", sig.name);
-            all = false;
+            if (sig.optional) Log("firma opcional ausente: %s", sig.name);
+            else LogE("firma no encontrada: %s", sig.name);
             continue;
         }
         *sig.slot = reinterpret_cast<void*>(hit);
     }
-    return all;
+    return g_api.ok();
 }
 
 // --- API expuesta a Lua -----------------------------------------------------
@@ -155,15 +162,11 @@ int api_getkey(lua_State* L) {
 }
 
 void RegisterInternal(lua_State* L) {
-    g_api.createtable(L, 0, 4);
+    g_api.createtable(L, 0, 3);
     g_api.pushcclosure(L, api_log, 0);       g_api.setfield(L, -2, "log");
     g_api.pushcclosure(L, api_version, 0);   g_api.setfield(L, -2, "version");
     g_api.pushcclosure(L, api_getkey, 0);    g_api.setfield(L, -2, "mouse1");
-    g_api.setglobal(L, "cheat");
-
-    g_api.getglobal(L, "_G");
-    g_api.pushstring(L, "fivem-cheat");
-    g_api.setfield(L, -2, "__cheat");
+    g_api.setfield(L, kGlobalsIndex, "cheat");
     g_api.settop(L, 0);
 }
 } // namespace
