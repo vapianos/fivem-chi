@@ -123,6 +123,10 @@ bool PlausiblePtr(uint64_t v) {
     return v > 0x10000 && v < 0x0000800000000000ULL;
 }
 
+bool HashLike(uint64_t v) {
+    return v >= 0x0001000000000000ULL;
+}
+
 // joaat identico al del juego: GET_HASH_KEY lo aplica tras pasar a minusculas.
 uint32_t Joaat(const char* s) {
     uint32_t h = 0;
@@ -393,47 +397,57 @@ std::vector<ModuleInfo> ScoredModules(int maxScore) {
     return out;
 }
 
-// ---- 1) invocador por patron (rapido, como pista secundaria) ----------------
+// ---- 1) invocador por patron ----------------------------------------------
+// El offset del E8 va explicito por patron: deducirlo de pat[3] era erroneo
+// (pat[3] es '8', no '?') y dejaba la lista de invocadores siempre vacia.
 
-void AddInvoker(uintptr_t fn) {
+struct InvPat { const char* text; size_t e8; };
+
+void AddInvoker(uintptr_t fn, const char* where) {
     if (!fn || !scanner::InExecutableSection(fn)) return;
     for (auto& c : g_cands)
         if (c.mode == MODE_INVOKER && c.target == reinterpret_cast<void*>(fn)) return;
     if (g_cands.size() >= 24) return;
     g_cands.push_back({ MODE_INVOKER, reinterpret_cast<void*>(fn), 0, 0 });
+    Log("[native] invocador candidato en %s (%p)", where, reinterpret_cast<void*>(fn));
 }
 
 void CollectInvokers() {
-    static const char* kPats[] = {
-        "48 8D 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 8B CF",
-        "48 8D 0D ? ? ? ? 48 8B D7 E8",
+    static const InvPat kPats[] = {
+        { "48 8D 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 8B CF", 10 },
+        { "48 8D 0D ? ? ? ? 48 8B D7 E8", 10 },
+        { "48 8B D7 E8 ? ? ? ? 48 8B CF", 3 },
+        { "48 8D 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 85 C0", 10 },
     };
 
     for (auto& m : ScoredModules(4)) {
         if (g_cands.size() >= 12) break;
-        for (const char* pat : kPats) {
-            for (uintptr_t at : scanner::FindAll(m, pat, 2)) {
-                const size_t e8 = (pat[3] == '?') ? 10 : 3;
-                if (*reinterpret_cast<const uint8_t*>(at + e8) != 0xE8) continue;
-                const int32_t rel = *reinterpret_cast<int32_t*>(at + e8 + 1);
-                AddInvoker(at + e8 + 5 + rel);
+
+        size_t before = g_cands.size();
+        for (const InvPat& p : kPats) {
+            for (uintptr_t at : scanner::FindAll(m, p.text, 2)) {
+                if (*reinterpret_cast<const uint8_t*>(at + p.e8) != 0xE8) continue;
+                const int32_t rel = *reinterpret_cast<int32_t*>(at + p.e8 + 1);
+                char where[96]{};
+                snprintf(where, sizeof(where), "%s+0x%llX", m.name.c_str(),
+                         (unsigned long long)(at - m.base));
+                AddInvoker(at + p.e8 + 5 + rel, where);
             }
+            if (g_cands.size() >= 12) break;
         }
+        if (g_cands.size() != before)
+            Log("[native] %zu invocador(es) en %s", g_cands.size() - before, m.name.c_str());
     }
-    Log("[native] invocadores por patron: %zu", g_cands.size());
+    Log("[native] invocadores: %zu", g_cands.size());
 }
 
-// ---- 2) tabla por estructura (sin patrones, funciona en cualquier build) ----
-//
-// La tabla real es void*[256] de punteros a nodos { next, handler, hash }. Se
-// reconoce porque todas las entradas apuntan a memoria valida, el handler cae
-// en seccion ejecutable y el otro campo es un hash de 64 bits (los punteros no
-// pasan de 2^47, los hashes si).
+// ---- 2) tabla por estructura ----------------------------------------------
+// Nodo { next, handler, hash } en cualquier orden: se clasifican los tres
+// campos en vez de asumir posiciones.
 
 bool AnalyzeTable(uintptr_t at, int& hashOff, int& handlerOff) {
     auto* t = reinterpret_cast<uint64_t*>(at);
 
-    // prefiltro barato: cuatro entradas seguidas que parezcan punteros
     for (int i = 0; i < 4; ++i)
         if (!PlausiblePtr(t[i])) return false;
 
@@ -444,9 +458,11 @@ bool AnalyzeTable(uintptr_t at, int& hashOff, int& handlerOff) {
         if (!Readable(reinterpret_cast<void*>(n), 24)) return false;
         ++nonNull;
     }
-    if (nonNull < 100) return false;   // de 128 muestras
+    if (nonNull < 100) return false;
 
-    int hOff = 0, hdOff = 0, hits = 0;
+    int hits[3] = {};
+    const int pairs[3][2] = { { 8, 16 }, { 16, 8 }, { 0, 8 } };
+
     for (int i = 0; i < 256; i += 4) {
         uintptr_t n = static_cast<uintptr_t>(t[i]);
         for (int g = 0; g < 3 && n; ++g) {
@@ -455,34 +471,53 @@ bool AnalyzeTable(uintptr_t at, int& hashOff, int& handlerOff) {
             const uint64_t next = Read64(n);
             const uint64_t a = Read64(n + 8);
             const uint64_t b = Read64(n + 16);
-
             const bool execA = scanner::InExecutableSection(static_cast<uintptr_t>(a));
             const bool execB = scanner::InExecutableSection(static_cast<uintptr_t>(b));
-            if (!execA && !execB) break;
+            if (execA == execB) break;
 
             const uint64_t hash = execA ? b : a;
-            if (hash < 0x0001000000000000ULL) break;
+            if (!HashLike(hash)) break;
 
-            ++hits;
-            hOff  = execA ? 16 : 8;
-            hdOff = execA ? 8 : 16;
+            ++hits[execA ? 0 : 1];
+            if (PlausiblePtr(Read64(n + (execA ? 0 : 0)))) {}   // next se sigue abajo
             n = static_cast<uintptr_t>(next);
         }
     }
-    if (hits < 60) return false;
 
-    hashOff = hOff;
-    handlerOff = hdOff;
+    int bestIdx = -1, best = 0;
+    for (int i = 0; i < 2; ++i)
+        if (hits[i] > best) { best = hits[i]; bestIdx = i; }
+
+    if (bestIdx < 0 || best < 60) return false;
+
+    // pairs[0]: handler en +8, hash en +16 (next en +0)
+    // pairs[1]: handler en +16, hash en +8
+    hashOff = pairs[bestIdx][0];
+    handlerOff = pairs[bestIdx][1];
     return true;
+}
+
+void ScanDataRegion(uintptr_t from, uintptr_t to, const char* where, int& found) {
+    for (uintptr_t at = (from + 7) & ~(uintptr_t)7; at + 256 * 8 <= to; at += 8) {
+        int h = 0, hd = 0;
+        if (!AnalyzeTable(at, h, hd)) continue;
+        g_cands.push_back({ MODE_TABLE, reinterpret_cast<void*>(at), h, hd });
+        Log("[native] tabla en %s (%p, hash+0x%X handler+0x%X)",
+            where, reinterpret_cast<void*>(at), h, hd);
+        if (++found >= 20) return;
+    }
 }
 
 void CollectTables() {
     int found = 0;
+
+    // a) secciones de datos de modulos Citizen / juego
     for (auto& m : ScoredModules(7)) {
+        if (found >= 20) break;
         uintptr_t cursor = m.base;
         const uintptr_t end = m.base + m.size;
 
-        while (cursor < end && found < 24) {
+        while (cursor < end && found < 20) {
             MEMORY_BASIC_INFORMATION mbi{};
             if (!VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi))) break;
 
@@ -492,24 +527,42 @@ void CollectTables() {
 
             const DWORD p = mbi.Protect;
             const bool data = mbi.State == MEM_COMMIT && !(p & (PAGE_GUARD | PAGE_NOACCESS)) &&
-                              !(p & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) &&
-                              (p & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_READONLY));
+                              (p & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_READONLY)) &&
+                              !(p & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
 
-            if (data && re > cursor + 256 * 8) {
-                for (uintptr_t at = (cursor + 7) & ~(uintptr_t)7; at + 256 * 8 <= re; at += 8) {
-                    int h = 0, hd = 0;
-                    if (!AnalyzeTable(at, h, hd)) continue;
-                    g_cands.push_back({ MODE_TABLE, reinterpret_cast<void*>(at), h, hd });
-                    Log("[native] tabla estructural en %s+0x%llX (hash+0x%X handler+0x%X)",
-                        m.name.c_str(), (unsigned long long)(at - m.base), h, hd);
-                    if (++found >= 24) break;
-                }
-            }
+            if (data && re > cursor + 256 * 8)
+                ScanDataRegion(cursor, re, m.name.c_str(), found);
+
             cursor = re ? re : cursor + 0x1000;
         }
-        if (found) break;
     }
-    Log("[native] tablas estructurales: %d", found);
+
+    // b) memoria reservada: la tabla puede vivir en el heap, no en el modulo
+    if (found == 0) {
+        uintptr_t cursor = 0x10000;
+        int regions = 0;
+        while (cursor < 0x00007FFFFFFE0000ULL && regions < 6000 && found < 20) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi))) {
+                cursor += 0x10000;
+                continue;
+            }
+
+            const uintptr_t rb = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+            const uintptr_t re = rb + mbi.RegionSize;
+
+            if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE &&
+                (mbi.Protect & PAGE_READWRITE) && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+                mbi.RegionSize >= 256 * 8 && mbi.RegionSize <= 0x100000) {
+                ++regions;
+                ScanDataRegion(rb, re, "heap", found);
+            }
+            cursor = re > cursor ? re : cursor + 0x1000;
+        }
+        Log("[native] regiones de heap revisadas: %d", regions);
+    }
+
+    Log("[native] tablas: %d", found);
 }
 
 // -------------------------------------------------------------- comprobacion
@@ -539,7 +592,7 @@ void Accept(const Candidate& c) {
     Log("[native] VALIDADO con %s en %p", g_mode == MODE_INVOKER ? "invocador" : "tabla", c.target);
 }
 
-// GET_HASH_KEY("abc") tiene que devolver exactamente joaat("abc"). Esto prueba
+// GET_HASH_KEY("abc") tiene que devolver exactamente joaat("abc"): prueba
 // binding, ABI, orden de argumentos y paso de strings de una sola vez.
 bool Confirm(const Candidate& c) {
     Apply(c);
@@ -565,17 +618,18 @@ bool Confirm(const Candidate& c) {
 
 void TryResolve() {
     CollectInvokers();
-    for (auto& c : g_cands)
-        if (Confirm(c)) return;
+    for (size_t i = 0; i < g_cands.size(); ++i) {
+        if (Confirm(g_cands[i])) return;
+        Log("[native] invocador %zu descartado", i);
+    }
 
-    const size_t before = g_cands.size();
     g_cands.clear();
     CollectTables();
     for (size_t i = 0; i < g_cands.size(); ++i) {
         if (Confirm(g_cands[i])) return;
-        if (g_nativeOk) return;
+        Log("[native] tabla %zu descartada", i);
     }
-    Log("[native] sin resolucion (invocadores: %zu, tablas: %zu)", before, g_cands.size());
+    Log("[native] sin resolucion");
 }
 
 DWORD WINAPI ScanThread(LPVOID) {
@@ -590,7 +644,7 @@ DWORD WINAPI ScanThread(LPVOID) {
 
         if (g_nativeOk) return 0;
         g_status = "sin candidato valido, reintentando";
-        Sleep(2000);
+        Sleep(2500);
     }
     return 0;
 }
