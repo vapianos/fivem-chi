@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <MinHook.h>
 #include <psapi.h>
+#include <dbghelp.h>
 #include <string>
 #include "utils/log.h"
 #include "utils/paths.h"
@@ -28,7 +29,7 @@ static void BootMark(const char* text) {
     CreateDirectoryW(dir, nullptr);
 
     const std::wstring path = std::wstring(dir) + L"\\boot.log";
-    HANDLE h = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
+    HANDLE h = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return;
 
@@ -42,7 +43,6 @@ static void BootMark(const char* text) {
     CloseHandle(h);
 }
 
-// Cada etapa aislada: una excepcion marca y sigue, nunca aborta el arranque.
 template <typename F>
 static bool Stage(const char* name, F&& fn) {
     try {
@@ -115,6 +115,42 @@ static bool SelfImportsRuntime() {
     return false;
 }
 
+// dbghelp se carga con LoadLibrary y no por import: el manual map resuelve los
+// imports contra el proceso del inyector y las direcciones de una DLL con ASLR
+// no coinciden entre procesos.
+using MiniDumpWriteDump_t = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, DWORD, void*, void*, void*);
+
+static void WriteDump(EXCEPTION_POINTERS* ep) {
+    HMODULE dbg = LoadLibraryW(L"dbghelp.dll");
+    if (!dbg) { LogE("sin dbghelp, sin volcado"); return; }
+
+    auto write = reinterpret_cast<MiniDumpWriteDump_t>(
+        GetProcAddress(dbg, "MiniDumpWriteDump"));
+    if (!write) { FreeLibrary(dbg); return; }
+
+    const std::wstring file = paths::DataDirW() + L"\\crash.dmp";
+    HANDLE h = CreateFileW(file.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { FreeLibrary(dbg); return; }
+
+    void* info = nullptr;
+    MINIDUMP_EXCEPTION_INFORMATION mei{};
+    if (ep) {
+        mei.ThreadId = GetCurrentThreadId();
+        mei.ExceptionPointers = ep;
+        mei.ClientPointers = FALSE;
+        info = &mei;
+    }
+
+    const DWORD type = MiniDumpWithThreadInfo | MiniDumpWithIndirectlyReferencedMemory;
+    if (write(GetCurrentProcess(), GetCurrentProcessId(), h, type, info, nullptr, nullptr))
+        LogE("volcado escrito en %s", paths::ToUtf8(file).c_str());
+    else
+        LogE("MiniDumpWriteDump fallo: %lu", GetLastError());
+
+    CloseHandle(h);
+}
+
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
     const auto* rec = ep->ExceptionRecord;
     BootMark("CRASH");
@@ -126,6 +162,7 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
     for (USHORT i = 0; i < n; ++i)
         LogFrame("  #", reinterpret_cast<uintptr_t>(frames[i]));
 
+    WriteDump(ep);
     LogShutdown();
     return EXCEPTION_EXECUTE_HANDLER;
 }
@@ -179,17 +216,20 @@ static DWORD WINAPI Init(LPVOID) {
         Sleep(3000);
     });
 
-    // El overlay va primero y aislado: el menu debe abrir aunque los natives fallen.
-    const bool overlayOk = Stage("overlay", [] { overlay::init(); });
-    BootMark(overlayOk ? "overlay armado" : "overlay fallo");
-
+    // Natives primero: si la tabla no esta lista, el overlay dibuja un frame
+    // vacio por cada Present y luego nunca reintenta.
     const bool nativeOk = Stage("natives", [] { native::init(); });
     BootMark(nativeOk ? "natives ok" : "natives fallo");
 
+    const bool overlayOk = Stage("overlay", [] { overlay::init(); });
+    BootMark(overlayOk ? "overlay armado" : "overlay fallo");
+
+    // El runtime Lua se resuelve siempre; el hook solo se instala si hay API.
+    Stage("lua", [] { lua::init(); });
     if (mhook) Stage("hooks", [] { hooks::init(); });
 
     if (config::Get().loadOnStart) {
-        Sleep(1000);
+        Sleep(500);
         Stage("scripts", [] { scripts::load_all(); });
     }
 

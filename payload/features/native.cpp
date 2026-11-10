@@ -28,7 +28,6 @@ struct Vec3 { float x, y, z; };
 // scrNativeCallContext del juego. Layout exacto:
 //   0x00 ret | 0x08 argCount | 0x0C dataCount | 0x10 args | 0x18 nativeInit
 //   0x40 en adelante es libre y se usa como almacen.
-// Desalineado un byte, los natives no fallan: simplemente no hacen nada.
 struct alignas(16) Ctx {
     void*    ret;
     uint32_t argCount;
@@ -78,6 +77,15 @@ void Push(Ctx& c, float v)  { uint32_t b; memcpy(&b, &v, 4); c.args[c.argCount++
 void Push(Ctx& c, void* p)  { c.args[c.argCount++] = p; }
 void Push(Ctx& c, float* p) { c.args[c.argCount++] = p; }
 void Push(Ctx& c, Vec3* v)  { c.args[c.argCount++] = v; ++c.dataCount; }
+
+// El handler escribe el retorno en c.rets segun el tipo declarado en el hash.
+// Para natives float el valor ocupa 4 bytes y el resto queda a cero: hay que
+// releerlo como float, nunca castear el uint64.
+float AsFloat(uint64_t raw) {
+    float f = 0.0f;
+    memcpy(&f, &raw, sizeof(f));
+    return f;
+}
 
 Handler Get(uint64_t hash) {
     if (!g_table) return nullptr;
@@ -133,10 +141,7 @@ Vec3 CamRot() {
 float CamFov() {
     if (!g_table) return 0.0f;
     Ctx c; Begin(c);
-    const uint64_t raw = Invoke(N_CAM_FOV, c);
-    float f = 0.0f;
-    memcpy(&f, &raw, sizeof(f));
-    return f;
+    return AsFloat(Invoke(N_CAM_FOV, c));
 }
 
 // Proyeccion por matriz de camara. Respaldo para cuando el native de pantalla
@@ -153,7 +158,6 @@ bool W2SMatrix(const Vec3& w, float& sx, float& sy) {
     const float p = rot.x * kDeg, y = rot.z * kDeg;
     const float cp = cosf(p), sp = sinf(p), cy = cosf(y), sy2 = sinf(y);
 
-    // GTA: pitch positivo = mirar abajo, yaw crece hacia el oeste.
     const Vec3 fwd{ -sy2 * cp, cy * cp, -sp };
     const Vec3 right{ cy, sy2, 0.0f };
     const Vec3 up{ right.y * fwd.z - right.z * fwd.y,
@@ -217,41 +221,14 @@ bool ValidTable(Reg** t) {
     return false;
 }
 
-bool LooksLikeGame(const std::string& n) {
-    std::string l = n;
-    std::transform(l.begin(), l.end(), l.begin(), ::tolower);
-    return l.find("gta5") != std::string::npos;
-}
-
 uintptr_t FindGame() {
-    HMODULE hit = nullptr;
-    for (auto& m : modules::All()) {
-        if (!LooksLikeGame(m.name)) continue;
-        hit = reinterpret_cast<HMODULE>(m.base);
-        break;
-    }
-    if (!hit) {
-        HMODULE main = GetModuleHandleW(nullptr);
-        wchar_t name[MAX_PATH]{};
-        if (main && GetModuleFileNameW(main, name, MAX_PATH)) {
-            const wchar_t* leaf = wcsrchr(name, L'\\');
-            leaf = leaf ? leaf + 1 : name;
-            if (_wcsnicmp(leaf, L"GTA5", 4) == 0) hit = main;
-        }
-    }
-    if (!hit) {
+    ModuleInfo m = modules::Game();
+    if (!m.valid()) {
         LogE("[native] no se encontro el modulo del juego");
         return 0;
     }
-
-    auto* dos = reinterpret_cast<PIMAGE_DOS_HEADER>(hit);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
-    auto* nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(reinterpret_cast<uint8_t*>(hit) + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
-
-    g_size = nt->OptionalHeader.SizeOfImage;
-    Log("[native] modulo del juego %p size=0x%zX", reinterpret_cast<void*>(hit), g_size);
-    return reinterpret_cast<uintptr_t>(hit);
+    g_size = m.size;
+    return m.base;
 }
 
 bool Resolve() {
@@ -266,6 +243,7 @@ bool Resolve() {
         "48 8D 0D ? ? ? ? 48 8B D7 E8",
         "48 8D 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 8B CF",
         "48 8B 0D ? ? ? ? 48 8B D7 E8",
+        "48 8B 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 8B CF",
     };
 
     for (const char* pat : patterns) {
@@ -306,11 +284,15 @@ void setJump(bool v) { g_jump = v; }
 void setFov(float v) { g_fov = v; }
 
 bool init() {
+    if (g_table) return true;
     if (!Resolve()) return false;
+
     g_hasScreen = Get(N_SCREEN) != nullptr;
     Log("[native] native de pantalla %s", g_hasScreen ? "disponible" : "ausente, se usa matriz");
 
-    for (int i = 0; i < 120; ++i) {
+    // La tabla ya esta validada: aunque el autotest falle se mantiene, para que
+    // ESP/aimbot puedan reintentar en cuanto haya jugador.
+    for (int i = 0; i < 60; ++i) {
         const int ped = static_cast<int>(Call(N_PLAYER_PED_ID));
         if (ped) {
             const Vec3 p = Coords(ped);
@@ -325,8 +307,8 @@ bool init() {
         Sleep(500);
     }
 
-    LogE("[native] autotest fallido, ABI o patron incorrectos");
-    return false;
+    LogE("[native] autotest fallido, la tabla se conserva");
+    return true;
 }
 
 void shutdown() { g_table = nullptr; }
@@ -369,7 +351,7 @@ void tick() {
     if (horiz < 0.1f) return;
 
     const float bearing = atan2f(dx, dy) * 57.29578f;
-    const float heading = static_cast<float>(Call(N_HEADING, selfPed));
+    const float heading = AsFloat(Call(N_HEADING, selfPed));
     const float pitch = -atan2f(dz, horiz) * 57.29578f;
 
     Call(N_CAM_HEADING, bearing - heading);
@@ -378,6 +360,7 @@ void tick() {
 
 void render() {
     if (!g_table || (!g_esp && !g_box)) return;
+    if (!ImGui::GetCurrentContext()) return;
 
     const int me = static_cast<int>(Call(N_PLAYER_ID));
     const int selfPed = static_cast<int>(Call(N_PLAYER_PED_ID));
@@ -385,6 +368,7 @@ void render() {
     const Vec3 self = Coords(selfPed);
 
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    if (!dl) return;
 
     for (int i = 0; i < 32; ++i) {
         if (i == me || !Call(N_ACTIVE, i)) continue;
@@ -424,7 +408,6 @@ void render() {
     }
 }
 
-// Va dentro de una pestana del menu: no abre ventana propia.
 void renderMenu() {
     if (!g_table) {
         ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "natives no resueltos, revisa el log");

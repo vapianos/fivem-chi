@@ -112,7 +112,8 @@ void Load() {
                 while (keyLen && (key[keyLen - 1] == ' ' || key[keyLen - 1] == '\t')) --keyLen;
 
                 const char* val = eq + 1;
-                size_t valLen = len - keyLen - 1;
+                // el valor arranca justo tras el '=', no tras la clave recortada
+                size_t valLen = len - static_cast<size_t>(eq - line) - 1;
                 while (valLen && (*val == ' ' || *val == '\t')) { ++val; --valLen; }
 
                 if (keyLen) Apply(key, keyLen, val, valLen);

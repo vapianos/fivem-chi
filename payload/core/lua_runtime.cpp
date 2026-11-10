@@ -10,11 +10,8 @@
 #include <utility>
 #include <fstream>
 #include <sstream>
+#include <algorithm>
 
-// ---------------------------------------------------------------------------
-// Firmas Lua 5.4 x64. Se resuelven contra TODOS los módulos cargados.
-// Si FiveM actualiza, regenera únicamente la firma que falle.
-// ---------------------------------------------------------------------------
 namespace {
 
 using lua_pushcclosure_t = void (*)(lua_State*, int (*)(lua_State*), int);
@@ -64,13 +61,42 @@ struct Sig {
 };
 
 LuaApi            g_api;
-std::mutex        g_mutex;
+// recursivo: RunString puede reentrar (un script que hace load()) y el lock
+// se toma alrededor de la llamada a Lua.
+std::recursive_mutex g_mutex;
 lua_State*        g_state = nullptr;
 bool              g_ready = false;
 std::vector<std::pair<std::string, std::string>> g_pending;
 
+// Modulos donde vive de verdad el runtime Lua de FiveM, por prioridad.
+const char* kLuaModules[] = {
+    "citizen-scripting-lua",
+    "gta5",
+    "gtaprocess",
+    "adhesive",
+    "citizen-resources-core",
+    "citizen-resources-client",
+};
+
+bool Preferred(const std::string& name) {
+    std::string l = name;
+    std::transform(l.begin(), l.end(), l.begin(), [](unsigned char c) { return (char)::tolower(c); });
+    for (const char* p : kLuaModules)
+        if (l.find(p) != std::string::npos) return true;
+    return false;
+}
+
+// Prioriza modulos conocidos y, dentro de cada uno, acepta el primer hit:
+// exigir unicidad absoluta descarta modulos validos (hay firmas con 8 hits).
 uintptr_t FindAnywhere(const char* pattern) {
-    for (auto& m : modules::All()) {
+    auto mods = modules::All();
+
+    std::vector<ModuleInfo> ordered;
+    ordered.reserve(mods.size());
+    for (auto& m : mods) if (Preferred(m.name)) ordered.push_back(m);
+    for (auto& m : mods) if (!Preferred(m.name)) ordered.push_back(m);
+
+    for (auto& m : ordered) {
         if (uintptr_t hit = scanner::FindIn(m, pattern))
             return hit;
     }
@@ -145,6 +171,7 @@ void RegisterInternal(lua_State* L) {
 namespace lua {
 
 bool init() {
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (g_ready) return true;
     if (!Resolve()) {
         LogE("no se pudieron resolver todas las firmas de Lua");
@@ -156,7 +183,7 @@ bool init() {
 }
 
 void shutdown() {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     g_pending.clear();
     g_state = nullptr;
     g_ready = false;
@@ -174,12 +201,11 @@ void RegisterApi(lua_State* L) {
 }
 
 void OnLoadBuffer(lua_State* L) {
-    if (!L) return;
+    if (!L || !g_ready) return;
 
     {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        if (g_state == L)
-            return; // ya registrado
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
+        if (g_state == L) return;   // ya registrado
         g_state = L;
     }
 
@@ -191,7 +217,9 @@ void OnLoadBuffer(lua_State* L) {
 bool RunString(const std::string& code, const std::string& chunkName) {
     if (!ready() || !g_api.ok()) return false;
 
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    if (!g_state) return false;
+
     const int top = g_api.gettop(g_state);
 
     if (g_api.loadbufferx(g_state, code.c_str(), code.size(), chunkName.c_str(), "t") != 0) {
@@ -226,14 +254,14 @@ bool RunFile(const std::filesystem::path& file) {
 }
 
 void PushPending(const std::string& name, std::string code) {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     g_pending.emplace_back(name, std::move(code));
 }
 
 void FlushPending() {
     std::vector<std::pair<std::string, std::string>> queue;
     {
-        std::lock_guard<std::mutex> lock(g_mutex);
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
         queue.swap(g_pending);
     }
     for (auto& [name, code] : queue)
@@ -241,7 +269,7 @@ void FlushPending() {
 }
 
 size_t PendingCount() {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
     return g_pending.size();
 }
 } // namespace lua

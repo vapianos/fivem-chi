@@ -22,13 +22,15 @@
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
 namespace {
-using Present_t   = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT);
-using ResizeBuf_t = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+using Present_t    = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT);
+using Present1_t   = HRESULT(__stdcall*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
+using ResizeBuf_t  = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 
-Present_t   o_present = nullptr;
-ResizeBuf_t o_resize  = nullptr;
-WNDPROC     o_wndproc = nullptr;
-void**      g_vtable  = nullptr;
+Present_t   o_present  = nullptr;
+Present1_t  o_present1 = nullptr;
+ResizeBuf_t o_resize   = nullptr;
+WNDPROC     o_wndproc  = nullptr;
+void**      g_vtable   = nullptr;
 
 ID3D11Device*           g_device  = nullptr;
 ID3D11DeviceContext*    g_context = nullptr;
@@ -96,6 +98,7 @@ struct D3DState {
 };
 
 void SaveState(D3DState& s) {
+    if (!g_context) return;
     g_context->OMGetRenderTargets(1, &s.rtv, &s.dsv);
     s.viewports = 1;
     g_context->RSGetViewports(&s.viewports, &s.vp);
@@ -111,6 +114,7 @@ void SaveState(D3DState& s) {
 }
 
 void RestoreState(D3DState& s) {
+    if (!g_context) return;
     g_context->OMSetRenderTargets(1, &s.rtv, s.dsv);
     if (s.viewports) g_context->RSSetViewports(s.viewports, &s.vp);
     g_context->RSSetState(s.rs);
@@ -160,27 +164,32 @@ void ReleaseRtv() {
     if (g_rtv) { g_rtv->Release(); g_rtv = nullptr; }
 }
 
-void CreateRtv(IDXGISwapChain* swap) {
+bool CreateRtv(IDXGISwapChain* swap) {
     ReleaseRtv();
-    if (!g_device || !swap) return;
+    if (!g_device || !swap) return false;
     ID3D11Texture2D* back = nullptr;
-    if (FAILED(swap->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&back))) || !back) return;
-    g_device->CreateRenderTargetView(back, nullptr, &g_rtv);
+    if (FAILED(swap->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&back))) || !back)
+        return false;
+    const HRESULT hr = g_device->CreateRenderTargetView(back, nullptr, &g_rtv);
     back->Release();
+    if (FAILED(hr) || !g_rtv) { g_rtv = nullptr; return false; }
+    return true;
 }
 
 void ApplyVisible(bool state) {
     if (state == g_visible) return;
     g_visible = state;
+
     if (state) {
         g_hadClip = GetClipCursor(&g_savedClip) != 0;
         ClipCursor(nullptr);
-        ImGui::GetIO().MouseDrawCursor = true;
     } else {
         if (g_hadClip) ClipCursor(&g_savedClip);
         g_hadClip = false;
-        ImGui::GetIO().MouseDrawCursor = false;
     }
+
+    if (ImGui::GetCurrentContext())
+        ImGui::GetIO().MouseDrawCursor = state;
 }
 
 void HandleKey(int vk) {
@@ -199,26 +208,29 @@ void HandleKey(int vk) {
 void PollKeys() {
     if (g_toggleReq.exchange(false)) ApplyVisible(!g_visible);
 
-    // Insert siempre responde, aunque la config tenga otra tecla o este corrupta.
     static const int keys[] = { VK_INSERT, VK_F8, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5 };
     static bool down[sizeof(keys) / sizeof(keys[0])]{};
     static bool extraDown = false;
 
+    const bool focused = g_hwnd && GetForegroundWindow() == g_hwnd;
+
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
         const bool d = (GetAsyncKeyState(keys[i]) & 0x8000) != 0;
-        if (d && !down[i]) HandleKey(keys[i]);
+        if (d && !down[i] && (focused || keys[i] == VK_INSERT)) HandleKey(keys[i]);
         down[i] = d;
     }
 
     const int extra = PrimaryKey();
     if (extra && extra != VK_INSERT) {
         const bool d = (GetAsyncKeyState(extra) & 0x8000) != 0;
-        if (d && !extraDown) HandleKey(extra);
+        if (d && !extraDown && focused) HandleKey(extra);
         extraDown = d;
     }
 }
 
 LRESULT CALLBACK hkWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (!o_wndproc) return DefWindowProcW(hwnd, msg, wp, lp);
+
     if (g_visible) {
         Enqueue(msg, wp, lp);
         switch (msg) {
@@ -236,104 +248,115 @@ LRESULT CALLBACK hkWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return CallWindowProcW(o_wndproc, hwnd, msg, wp, lp);
 }
 
-HRESULT ResizeBody(IDXGISwapChain* swap, UINT a, UINT b, UINT c, DXGI_FORMAT d, UINT e, bool& done) {
-    if (!o_resize) return E_FAIL;
+bool Setup(IDXGISwapChain* swap) {
+    DXGI_SWAP_CHAIN_DESC desc{};
+    if (FAILED(swap->GetDesc(&desc)) || !desc.OutputWindow) return false;
 
-    if (g_ready && g_device) {
+    DWORD owner = 0;
+    GetWindowThreadProcessId(desc.OutputWindow, &owner);
+    if (owner != GetCurrentProcessId()) return false;
+
+    ID3D11Device* dev = nullptr;
+    if (FAILED(swap->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&dev))) || !dev)
+        return false;
+
+    g_device = dev;
+    g_device->GetImmediateContext(&g_context);
+    g_hwnd = desc.OutputWindow;
+
+    if (!CreateRtv(swap)) {
+        LogE("sin render target, overlay no dibuja");
+    }
+
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+    ImGui::StyleColorsDark();
+
+    if (!ImGui_ImplWin32_Init(g_hwnd) || !ImGui_ImplDX11_Init(g_device, g_context)) {
+        LogE("backends de ImGui no inicializaron");
+        ImGui_ImplDX11_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
         ReleaseRtv();
-        if (ImGui::GetCurrentContext()) ImGui_ImplDX11_InvalidateDeviceObjects();
-        HRESULT hr = o_resize(swap, a, b, c, d, e);
-        done = true;
-        if (SUCCEEDED(hr) && g_device) {
-            CreateRtv(swap);
-            if (ImGui::GetCurrentContext()) ImGui_ImplDX11_CreateDeviceObjects();
-        }
-        return hr;
+        if (g_context) { g_context->Release(); g_context = nullptr; }
+        if (g_device) { g_device->Release(); g_device = nullptr; }
+        return false;
     }
 
-    HRESULT hr = o_resize(swap, a, b, c, d, e);
-    done = true;
-    return hr;
-}
-
-HRESULT __stdcall hkResize(IDXGISwapChain* swap, UINT a, UINT b, UINT c, DXGI_FORMAT d, UINT e) {
-    if (g_shuttingDown || !o_resize) return o_resize ? o_resize(swap, a, b, c, d, e) : E_FAIL;
-
-    bool done = false;
-    HRESULT hr = E_FAIL;
-    __try {
-        hr = ResizeBody(swap, a, b, c, d, e, done);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        LogE("excepcion en ResizeBuffers");
-        if (!done && o_resize) hr = o_resize(swap, a, b, c, d, e);
+    const LONG_PTR prev = SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(hkWndProc));
+    if (prev) {
+        o_wndproc = reinterpret_cast<WNDPROC>(prev);
+    } else {
+        o_wndproc = nullptr;
+        LogE("SetWindowLongPtrW fallo (%lu): se sigue sin WndProc", GetLastError());
     }
-    return hr;
+
+    g_autoShowAt = GetTickCount64() + 3000;
+    g_faults = 0;
+    g_ready = true;
+    Log("overlay listo, tecla del menu: 0x%02X", PrimaryKey());
+    return true;
 }
 
-HRESULT __stdcall hkPresent(IDXGISwapChain* swap, UINT sync, UINT flags);
-
-inline HRESULT Passthrough(IDXGISwapChain* swap, UINT sync, UINT flags, bool& done) {
-    done = true;
-    return o_present(swap, sync, flags);
+void DropDevice() {
+    if (ImGui::GetCurrentContext()) {
+        ImGui_ImplDX11_InvalidateDeviceObjects();
+        ImGui_ImplDX11_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+    }
+    ReleaseRtv();
+    if (g_context) { g_context->Release(); g_context = nullptr; }
+    if (g_device) { g_device->Release(); g_device = nullptr; }
+    g_ready = false;
 }
 
-// Sin __try aqui dentro: este cuerpo puede tener objetos con destructor, y las
-// excepciones C++ se recogen con try/catch, no con __except.
-HRESULT PresentBody(IDXGISwapChain* swap, UINT sync, UINT flags, bool& done) {
+void DrawFrame() {
+    Msg m;
+    while (Dequeue(m)) {
+        if (ImGui::GetCurrentContext())
+            ImGui_ImplWin32_WndProcHandler(g_hwnd, m.msg, m.wp, m.lp);
+    }
+
+    ImGui_ImplDX11_NewFrame();
+    ImGui_ImplWin32_NewFrame();
+    ImGui::NewFrame();
+
+    if (native::ready()) native::render();
+    if (g_visible) menu::Render();
+
+    ImGui::Render();
+
+    // Flip model: el backbuffer que deja el juego ya esta presentado. Hay que
+    // bindear SIEMPRE el RTV propio, se dibuje menu o solo ESP.
+    g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
+    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+}
+
+HRESULT PrepareAndDraw(IDXGISwapChain* swap, bool& drew) {
+    drew = false;
+
     if (!g_ready) {
-        DXGI_SWAP_CHAIN_DESC desc{};
-        if (FAILED(swap->GetDesc(&desc))) return Passthrough(swap, sync, flags, done);
-
-        DWORD owner = 0;
-        GetWindowThreadProcessId(desc.OutputWindow, &owner);
-        if (owner != GetCurrentProcessId()) return Passthrough(swap, sync, flags, done);
-
-        ID3D11Device* dev = nullptr;
-        if (FAILED(swap->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&dev))) || !dev)
-            return Passthrough(swap, sync, flags, done);
-
-        g_device = dev;
-        g_device->GetImmediateContext(&g_context);
-        g_hwnd = desc.OutputWindow;
-
-        CreateRtv(swap);
-
-        ImGui::CreateContext();
-        ImGuiIO& io = ImGui::GetIO();
-        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-        io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
-        ImGui::StyleColorsDark();
-
-        if (!ImGui_ImplWin32_Init(g_hwnd) || !ImGui_ImplDX11_Init(g_device, g_context)) {
-            LogE("backends de ImGui no inicializaron");
-            ImGui_ImplDX11_Shutdown();
-            ImGui_ImplWin32_Shutdown();
-            ImGui::DestroyContext();
-            ReleaseRtv();
-            if (g_context) { g_context->Release(); g_context = nullptr; }
-            if (g_device) { g_device->Release(); g_device = nullptr; }
-            return Passthrough(swap, sync, flags, done);
-        }
-
-        o_wndproc = reinterpret_cast<WNDPROC>(
-            SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(hkWndProc)));
-
-        g_autoShowAt = GetTickCount64() + 3000;
-        g_ready = true;
-        g_faults = 0;
-        Log("overlay listo, tecla del menu: 0x%02X", PrimaryKey());
+        if (!Setup(swap)) return E_FAIL;
     }
+    if (!g_rtv && !CreateRtv(swap)) return S_OK;
 
     if (!g_loggedFirst) { g_loggedFirst = true; Log("primer Present recibido"); }
     ++g_frames;
 
     if (g_armed && g_frames % 120 == 0) {
         void* cur = g_vtable[8];
-        if (cur != reinterpret_cast<void*>(&hkPresent)) {
+        if (cur != reinterpret_cast<void*>(&o_present)) {
             if (cur) o_present = reinterpret_cast<Present_t>(cur);
-            PatchSlot(g_vtable, 8, reinterpret_cast<void*>(&hkPresent), nullptr);
+            PatchSlot(g_vtable, 8, reinterpret_cast<void*>(nullptr), nullptr);
+            g_vtable[8] = reinterpret_cast<void*>(+[](IDXGISwapChain* s, UINT a, UINT b) -> HRESULT {
+                return s->Present(a, b);
+            });
         }
-        if (g_hwnd && GetWindowLongPtrW(g_hwnd, GWLP_WNDPROC) != reinterpret_cast<LONG_PTR>(hkWndProc))
+        if (g_hwnd && o_wndproc &&
+            GetWindowLongPtrW(g_hwnd, GWLP_WNDPROC) != reinterpret_cast<LONG_PTR>(hkWndProc))
             SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(hkWndProc));
     }
 
@@ -347,81 +370,89 @@ HRESULT PresentBody(IDXGISwapChain* swap, UINT sync, UINT flags, bool& done) {
     }
 
     D3DState state{};
-    const bool draw = g_visible && g_rtv;
-    if (draw) SaveState(state);
+    SaveState(state);
 
-    bool rendered = false;
     try {
-        Msg m;
-        while (Dequeue(m)) ImGui_ImplWin32_WndProcHandler(g_hwnd, m.msg, m.wp, m.lp);
-
-        ImGui_ImplDX11_NewFrame();
-        ImGui_ImplWin32_NewFrame();
-        ImGui::NewFrame();
-
-        if (native::ready()) native::render();
-        if (g_visible) menu::Render();
-
-        ImGui::Render();
-        rendered = true;
-
-        if (draw) {
-            g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
-            ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-            RestoreState(state);
-        } else {
-            ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-        }
+        DrawFrame();
+        drew = true;
     } catch (const std::exception& e) {
         LogE("excepcion en el frame: %s", e.what());
         if (ImGui::GetCurrentContext() && ImGui::GetCurrentContext()->WithinFrameScope)
             ImGui::EndFrame();
-        if (draw) RestoreState(state);
     }
 
-    if (!rendered) {
-        const HRESULT hr0 = o_present(swap, sync, flags);
-        done = true;
-        return hr0;
-    }
+    RestoreState(state);
+    return S_OK;
+}
 
-    const HRESULT hr = o_present(swap, sync, flags);
-    done = true;
+HRESULT __stdcall hkResize(IDXGISwapChain* swap, UINT a, UINT b, UINT c, DXGI_FORMAT d, UINT e) {
+    if (!o_resize) return E_FAIL;
+    if (g_shuttingDown || !g_ready) return o_resize(swap, a, b, c, d, e);
 
-    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
-        LogE("dispositivo perdido (0x%08X), overlay se reinicia", hr);
-        if (ImGui::GetCurrentContext()) {
-            ImGui_ImplDX11_InvalidateDeviceObjects();
-            ImGui_ImplDX11_Shutdown();
-            ImGui_ImplWin32_Shutdown();
-            ImGui::DestroyContext();
-        }
-        ReleaseRtv();
-        if (g_context) { g_context->Release(); g_context = nullptr; }
-        if (g_device) { g_device->Release(); g_device = nullptr; }
-        g_ready = false;
+    // Todas las referencias al backbuffer tienen que soltarse antes del resize.
+    ReleaseRtv();
+    if (ImGui::GetCurrentContext()) ImGui_ImplDX11_InvalidateDeviceObjects();
+
+    const HRESULT hr = o_resize(swap, a, b, c, d, e);
+
+    if (SUCCEEDED(hr)) {
+        CreateRtv(swap);
+        if (ImGui::GetCurrentContext()) ImGui_ImplDX11_CreateDeviceObjects();
     }
     return hr;
+}
+
+void OnDeviceLost(HRESULT hr) {
+    LogE("dispositivo perdido (0x%08X), overlay se reinicia", hr);
+    DropDevice();
 }
 
 HRESULT __stdcall hkPresent(IDXGISwapChain* swap, UINT sync, UINT flags) {
     if (g_shuttingDown || g_inPresent || !o_present) return o_present(swap, sync, flags);
 
     g_inPresent = true;
+    bool drew = false;
     HRESULT hr = S_OK;
-    bool done = false;
 
     __try {
-        hr = PresentBody(swap, sync, flags, done);
+        hr = PrepareAndDraw(swap, drew);
         g_faults = 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         ++g_faults;
         if (g_faults <= 10 || (g_faults % 200) == 0)
             LogE("excepcion dentro de Present (total %d)", g_faults);
-        if (!done) hr = o_present(swap, sync, flags);
     }
 
+    if (!drew) hr = o_present(swap, sync, flags);
+    else if (hr == S_OK) hr = o_present(swap, sync, flags);
+
     g_inPresent = false;
+
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) OnDeviceLost(hr);
+    return hr;
+}
+
+HRESULT __stdcall hkPresent1(IDXGISwapChain1* swap, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* p) {
+    if (g_shuttingDown || g_inPresent || !o_present1) return o_present1(swap, sync, flags, p);
+
+    g_inPresent = true;
+    bool drew = false;
+    HRESULT hr = S_OK;
+
+    __try {
+        hr = PrepareAndDraw(swap, drew);
+        g_faults = 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ++g_faults;
+        if (g_faults <= 10 || (g_faults % 200) == 0)
+            LogE("excepcion dentro de Present1 (total %d)", g_faults);
+    }
+
+    if (!drew || hr == S_OK) hr = o_present1(swap, sync, flags, p);
+
+    g_inPresent = false;
+
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) OnDeviceLost(hr);
     return hr;
 }
 
@@ -437,7 +468,7 @@ void** GrabVtable() {
     if (!host) { LogE("sin ventana host"); return nullptr; }
 
     DXGI_SWAP_CHAIN_DESC desc{};
-    desc.BufferCount = 1;
+    desc.BufferCount = 2;
     desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.BufferDesc.RefreshRate.Numerator = 60;
     desc.BufferDesc.RefreshRate.Denominator = 1;
@@ -445,7 +476,9 @@ void** GrabVtable() {
     desc.OutputWindow = host;
     desc.SampleDesc.Count = 1;
     desc.Windowed = TRUE;
-    desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    // FLIP_DISCARD: es el modelo que usa FiveM/GTA. Con DISCARD la vtable que
+    // se obtiene puede no ser la misma clase que la del juego.
+    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
@@ -455,9 +488,17 @@ void** GrabVtable() {
 
     void** vt = nullptr;
 
-    const HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-                                                     levels, 2, D3D11_SDK_VERSION, &desc, &swap,
-                                                     &device, &obtained, &context);
+    HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+                                               levels, 2, D3D11_SDK_VERSION, &desc, &swap,
+                                               &device, &obtained, &context);
+    if (FAILED(hr) || !swap) {
+        desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+        desc.BufferCount = 1;
+        hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+                                           levels, 2, D3D11_SDK_VERSION, &desc, &swap,
+                                           &device, &obtained, &context);
+    }
+
     if (SUCCEEDED(hr) && swap) vt = *reinterpret_cast<void***>(swap);
     else LogE("D3D11CreateDeviceAndSwapChain fallo: 0x%08X", hr);
 
@@ -475,14 +516,22 @@ bool CreateSwapChainHook() {
     g_vtable = GrabVtable();
     if (!g_vtable) { LogE("no se pudo obtener la vtable de Present"); return false; }
 
-    const bool okP = PatchSlot(g_vtable, 8, reinterpret_cast<void*>(&hkPresent),
-                               reinterpret_cast<void**>(&o_present));
-    PatchSlot(g_vtable, 13, reinterpret_cast<void*>(&hkResize), reinterpret_cast<void**>(&o_resize));
+    const bool okP  = PatchSlot(g_vtable, 8, reinterpret_cast<void*>(&hkPresent),
+                                reinterpret_cast<void**>(&o_present));
+    const bool okR  = PatchSlot(g_vtable, 13, reinterpret_cast<void*>(&hkResize),
+                                reinterpret_cast<void**>(&o_resize));
+    // Present1 (indice 22) existe en IDXGISwapChain1+: si el juego lo usa, sin
+    // esto el hook nunca dispara.
+    const bool okP1 = (g_vtable[22] && g_vtable[22] != g_vtable[8])
+                        ? PatchSlot(g_vtable, 22, reinterpret_cast<void*>(&hkPresent1),
+                                    reinterpret_cast<void**>(&o_present1))
+                        : false;
 
     if (!okP) { LogE("no se pudo parchear Present"); return false; }
+    if (!okR) LogE("no se pudo parchear ResizeBuffers");
 
     g_armed = true;
-    Log("vtable parcheada (Present + ResizeBuffers)");
+    Log("vtable parcheada (Present%s + ResizeBuffers)", okP1 ? " + Present1" : "");
     return true;
 }
 } // namespace
@@ -504,19 +553,15 @@ void shutdown() {
     if (g_armed) {
         RestoreSlot(g_vtable, 8, reinterpret_cast<void*>(o_present));
         RestoreSlot(g_vtable, 13, reinterpret_cast<void*>(o_resize));
+        RestoreSlot(g_vtable, 22, reinterpret_cast<void*>(o_present1));
         g_armed = false;
     }
 
     if (g_ready) {
         if (g_hwnd && o_wndproc)
             SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(o_wndproc));
-        ImGui_ImplDX11_Shutdown();
-        ImGui_ImplWin32_Shutdown();
-        ImGui::DestroyContext();
-        ReleaseRtv();
-        if (g_context) { g_context->Release(); g_context = nullptr; }
-        if (g_device) { g_device->Release(); g_device = nullptr; }
-        g_ready = false;
+        o_wndproc = nullptr;
+        DropDevice();
     }
 }
 

@@ -9,12 +9,18 @@
 #pragma comment(lib, "psapi.lib")
 
 namespace {
-bool HasAny(const std::string& hay, const std::vector<std::string>& needles) {
-    for (auto& n : needles) {
-        if (hay.find(n) != std::string::npos)
-            return true;
-    }
-    return false;
+std::string Lower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)::tolower(c); });
+    return s;
+}
+
+// FiveM renombra el ejecutable del juego en cada build (FiveM_b3889_GTAProcess.exe,
+// FiveM_b3407_GTAProcess.exe...). Nunca buscar "gta5" a secas.
+bool LooksLikeGame(const std::string& name) {
+    const std::string l = Lower(name);
+    return l.find("gtaprocess") != std::string::npos ||
+           l.find("gta5") != std::string::npos ||
+           l.find("gta5.exe") != std::string::npos;
 }
 } // namespace
 
@@ -61,29 +67,33 @@ std::vector<ModuleInfo> All() {
 }
 
 ModuleInfo ByName(const std::string& name) {
+    const std::string want = Lower(name);
     for (auto& m : All()) {
-        if (m.name.size() >= name.size() &&
-            _stricmp(m.name.c_str(), name.c_str()) == 0)
+        if (Lower(m.name) == want)
             return m;
     }
     return {};
 }
 
 ModuleInfo Game() {
-    // 1) módulo principal del proceso
+    // 1) modulo principal: en el proceso del juego es FiveM_bXXXX_GTAProcess.exe
     ModuleInfo main = Main();
-    std::string lower = main.name;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-    if (lower.find("fivem") != std::string::npos || lower.find("gta") != std::string::npos)
+    if (LooksLikeGame(main.name)) {
+        Log("[modules] modulo del juego (principal) %s base=%p size=0x%zX",
+            main.name.c_str(), reinterpret_cast<void*>(main.base), main.size);
         return main;
-
-    // 2) módulos secundarios típicos de CitizenFX
-    for (auto& m : All()) {
-        std::string n = m.name;
-        std::transform(n.begin(), n.end(), n.begin(), ::tolower);
-        if (HasAny(n, { "fivem", "gtaprocess", "gta5.exe", "gta5" }))
-            return m;
     }
+
+    // 2) cualquier modulo que sea el proceso del juego, aunque no sea el principal
+    for (auto& m : All()) {
+        if (LooksLikeGame(m.name)) {
+            Log("[modules] modulo del juego (secundario) %s base=%p size=0x%zX",
+                m.name.c_str(), reinterpret_cast<void*>(m.base), m.size);
+            return m;
+        }
+    }
+
+    LogE("[modules] sin modulo de juego (principal: %s)", main.name.c_str());
     return {};
 }
 
