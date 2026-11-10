@@ -9,44 +9,46 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <vector>
 
 #include "imgui.h"
 
 namespace {
 
-using Handler = void(*)(void*);
+using Handler  = void(*)(void*);
+using Invoker  = void(*)(void*, uint64_t);
 
-// Nodo de la tabla de registro. El orden real es { next, handler, hash }: el
-// hash va al final. No se usa como struct, solo para tipar el array de cubos,
-// porque los nodos se leen por offset (ver g_hashOff / g_handlerOff).
+// Nodo de la tabla de registro (solo si se usa el modo tabla).
 struct Reg {
     Reg*     next;
     Handler  handler;
     uint64_t hash;
 };
 
-// Layout de scrNativeCallContext: offsets de ret, argCount, dataCount y args.
+// Offsets dentro de scrNativeCallContext.
 struct Abi {
-    int ret, argCount, dataCount, args;
+    int ret, argCount, dataCount, args, hash;
 };
 
 #pragma pack(push, 1)
 struct Vec3 { float x, y, z; };
 
-// Contexto crudo. No se declara con campos porque el layout se decide en
-// caliente (ver kAbis); los campos se escriben por offset.
-//   0x70 ret | 0x80..0xF0 slots de argumentos
+//   0x70 ret | 0x80..0xF0 argumentos
 struct alignas(16) Ctx {
     uint8_t raw[0x100];
 };
 #pragma pack(pop)
 
-Reg**     g_table = nullptr;
-uintptr_t g_game  = 0;
-size_t    g_size  = 0;
-int       g_hashOff    = 16;   // offset de hash dentro del nodo
-int       g_handlerOff = 8;    // offset de handler dentro del nodo
-Abi       g_abi{ 0x00, 0x08, 0x0C, 0x10 };
+enum Mode { MODE_TABLE, MODE_INVOKER };
+
+Mode      g_mode   = MODE_TABLE;
+Reg**     g_table  = nullptr;
+Invoker   g_invoker = nullptr;
+uintptr_t g_game   = 0;
+size_t    g_size   = 0;
+int       g_hashOff    = 16;
+int       g_handlerOff = 8;
+Abi       g_abi{ 0x00, 0x08, 0x0C, 0x10, 0x18 };
 bool      g_nativeOk  = false;
 bool      g_hasScreen = false;
 int       g_screenFails = 0;
@@ -89,12 +91,13 @@ bool Readable(const void* p, size_t len) {
            reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
 }
 
-void Begin(Ctx& c) {
+void Begin(Ctx& c, uint64_t hash) {
     memset(c.raw, 0, sizeof(c.raw));
     void* args = c.raw + 0x80;
     void* ret  = c.raw + 0x70;
     memcpy(c.raw + g_abi.args, &args, 8);
     memcpy(c.raw + g_abi.ret,  &ret,  8);
+    memcpy(c.raw + g_abi.hash, &hash, 8);
 }
 
 void PushRaw(Ctx& c, void* v) {
@@ -129,8 +132,6 @@ uint64_t Ret(const Ctx& c) {
     return v;
 }
 
-// El handler escribe el retorno segun el tipo declarado en el hash. Para
-// natives float el valor ocupa 4 bytes: hay que releerlo como float.
 float AsFloat(uint64_t raw) {
     float f = 0.0f;
     memcpy(&f, &raw, sizeof(f));
@@ -149,23 +150,28 @@ Handler Get(uint64_t hash) {
 }
 
 uint64_t Invoke(uint64_t hash, Ctx& c) {
+    if (g_mode == MODE_INVOKER) {
+        if (!g_invoker) return 0;
+        g_invoker(c.raw, hash);
+        return Ret(c);
+    }
     Handler h = Get(hash);
     if (!h) return 0;
-    h(&c);
+    h(c.raw);
     return Ret(c);
 }
 
 template <typename... A>
 uint64_t Call(uint64_t hash, A... a) {
-    Ctx c; Begin(c);
+    Ctx c; Begin(c, hash);
     (Push(c, a), ...);
     return Invoke(hash, c);
 }
 
 Vec3 Coords(int ped) {
     Vec3 out{};
-    if (!ped || !g_table) return out;
-    Ctx c; Begin(c);
+    if (!ped) return out;
+    Ctx c; Begin(c, N_COORDS);
     Push(c, ped);
     Push(c, true);
     Push(c, &out);
@@ -175,8 +181,7 @@ Vec3 Coords(int ped) {
 
 Vec3 CamCoord() {
     Vec3 out{};
-    if (!g_table) return out;
-    Ctx c; Begin(c);
+    Ctx c; Begin(c, N_CAM_COORD);
     Push(c, &out);
     Invoke(N_CAM_COORD, c);
     return out;
@@ -184,8 +189,7 @@ Vec3 CamCoord() {
 
 Vec3 CamRot() {
     Vec3 out{};
-    if (!g_table) return out;
-    Ctx c; Begin(c);
+    Ctx c; Begin(c, N_CAM_ROT);
     Push(c, 2);
     Push(c, &out);
     Invoke(N_CAM_ROT, c);
@@ -193,13 +197,10 @@ Vec3 CamRot() {
 }
 
 float CamFov() {
-    if (!g_table) return 0.0f;
-    Ctx c; Begin(c);
+    Ctx c; Begin(c, N_CAM_FOV);
     return AsFloat(Invoke(N_CAM_FOV, c));
 }
 
-// Proyeccion por matriz de camara. Respaldo para cuando el native de pantalla
-// no existe o no devuelve nada en builds nuevas.
 bool W2SMatrix(const Vec3& w, float& sx, float& sy) {
     const Vec3 cam = CamCoord();
     const Vec3 rot = CamRot();
@@ -236,11 +237,11 @@ bool W2SMatrix(const Vec3& w, float& sx, float& sy) {
 }
 
 bool W2S(const Vec3& w, float& sx, float& sy) {
-    if (!g_table) return false;
+    if (!g_table && !g_invoker) return false;
 
     if (g_hasScreen) {
         float x = 0.0f, y = 0.0f;
-        Ctx c; Begin(c);
+        Ctx c; Begin(c, N_SCREEN);
         Push(c, w.x);
         Push(c, w.y);
         Push(c, w.z);
@@ -264,15 +265,9 @@ constexpr uint64_t kProbes[] = {
     N_INVINCIBLE, N_SUPERJUMP, N_NAME, N_CAM_COORD,
 };
 
-// Puntua cuantos hashes conocidos aparecen, con handler ejecutable, leyendo el
-// nodo con los offsets dados. Se prueban las dos distribuciones posibles.
 int ScoreTable(Reg** t, int hashOff, int handlerOff) {
     if (reinterpret_cast<uintptr_t>(t) < 0x10000) return 0;
-
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (!VirtualQuery(t, &mbi, sizeof(mbi))) return 0;
-    if (mbi.State != MEM_COMMIT) return 0;
-    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+    if (!Readable(t, 8)) return 0;
 
     int score = 0;
     __try {
@@ -293,18 +288,17 @@ int ScoreTable(Reg** t, int hashOff, int handlerOff) {
     return score;
 }
 
-// Layouts candidatos. Solo uno encaja; se comprueban en caliente.
+// Layouts candidatos de scrNativeCallContext.
 const Abi kAbis[] = {
-    { 0x00, 0x08, 0x0C, 0x10 },
-    { 0x00, 0x08, 0x0C, 0x18 },
-    { 0x08, 0x10, 0x14, 0x18 },
-    { 0x08, 0x10, 0x14, 0x20 },
-    { 0x00, 0x10, 0x14, 0x18 },
-    { 0x00, 0x18, 0x1C, 0x20 },
+    { 0x00, 0x08, 0x0C, 0x10, 0x18 },
+    { 0x00, 0x08, 0x0C, 0x18, 0x10 },
+    { 0x08, 0x10, 0x14, 0x18, 0x20 },
+    { 0x08, 0x10, 0x14, 0x20, 0x18 },
+    { 0x00, 0x10, 0x14, 0x18, 0x20 },
+    { 0x00, 0x08, 0x0C, 0x20, 0x18 },
 };
 
-// Tres pruebas encadenadas: retorno escalar sin args, retorno con un arg y
-// retorno por vector. Un layout falso falla o revienta en alguna.
+// Tres pruebas encadenadas: escalar sin args, un arg y retorno por vector.
 bool TestAbi(const Abi& a) {
     g_abi = a;
 
@@ -333,6 +327,37 @@ bool TestAbi(const Abi& a) {
     return fabsf(p.x) > 0.5f || fabsf(p.y) > 0.5f;
 }
 
+bool DetectAbi(const char* what) {
+    for (const Abi& a : kAbis) {
+        if (!TestAbi(a)) continue;
+        Log("[native] contexto valido con %s (ret+0x%X args+0x%X)", what, a.ret, a.args);
+        return true;
+    }
+    return false;
+}
+
+// Retrocede hasta el inicio de la funcion que contiene el `lea rcx,[tabla]`.
+// Se apoya en relleno int3 o en prologos conocidos, y se valida luego con
+// TestAbi, asi que un falso positivo se descarta solo.
+uintptr_t FunctionStart(uintptr_t hit) {
+    static const uint8_t kProl[] = { 0x48, 0x89, 0x5C, 0x24, 0x08 };
+
+    for (int back = 1; back < 0x200; ++back) {
+        uintptr_t p = hit - back;
+        const uint8_t here = *reinterpret_cast<const uint8_t*>(p);
+        const uint8_t prev = *reinterpret_cast<const uint8_t*>(p - 1);
+
+        if (here == 0xCC && prev == 0xCC) return p + 1;
+        if (prev == 0xCC || prev == 0xC3) {
+            if (!memcmp(reinterpret_cast<const void*>(p), kProl, sizeof(kProl))) return p;
+            if (here == 0x40 && *reinterpret_cast<const uint8_t*>(p + 1) == 0x55) return p;
+            if (here == 0x48 && *reinterpret_cast<const uint8_t*>(p + 1) == 0x83 &&
+                *reinterpret_cast<const uint8_t*>(p + 2) == 0xEC) return p;
+        }
+    }
+    return 0;
+}
+
 uintptr_t FindGame() {
     ModuleInfo m = modules::Game();
     if (!m.valid()) {
@@ -343,6 +368,7 @@ uintptr_t FindGame() {
     return m.base;
 }
 
+// Devuelve true si ha dejado un modo de invocacion funcionando.
 bool Resolve() {
     g_game = FindGame();
     if (!g_game) return false;
@@ -351,9 +377,6 @@ bool Resolve() {
     mod.base = g_game;
     mod.size = g_size;
 
-    // 48 8D 0D = lea rcx,[rip+x]: la tabla se usa directa.
-    // 48 8B 0D = mov rcx,[rip+x]: el global guarda el puntero, hay que
-    // desreferenciar. Las dos formas aparecen segun el build.
     struct Pat { const char* text; bool indirect; };
     static const Pat pats[] = {
         { "48 8D 0D ? ? ? ? 48 8B D7 E8", false },
@@ -363,64 +386,77 @@ bool Resolve() {
         { "48 8B 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 8B CF", true },
     };
 
+    // 1) invocador: no necesita la tabla, la busqueda la hace el propio juego.
+    std::vector<uintptr_t> starts;
+    for (const Pat& pat : pats) {
+        auto hits = scanner::FindAll(mod, pat.text, 128);
+        Log("[native] patron '%s' -> %zu coincidencias", pat.text, hits.size());
+        for (uintptr_t at : hits) {
+            uintptr_t start = FunctionStart(at);
+            if (!start || !scanner::InExecutableSection(start)) continue;
+            if (std::find(starts.begin(), starts.end(), start) != starts.end()) continue;
+            starts.push_back(start);
+        }
+    }
+
+    Log("[native] %zu funciones candidatas a invocador", starts.size());
+    for (uintptr_t start : starts) {
+        g_mode = MODE_INVOKER;
+        g_invoker = reinterpret_cast<Invoker>(start);
+        if (DetectAbi("invocador")) {
+            Log("[native] invocador en %p", reinterpret_cast<void*>(start));
+            return true;
+        }
+    }
+
+    // 2) tabla, por si el invocador no se localiza.
+    g_invoker = nullptr;
+    g_mode = MODE_TABLE;
+
     Reg** best = nullptr;
     int   bestScore = 0;
     int   bestHash = g_hashOff, bestHandler = g_handlerOff;
 
     for (const Pat& pat : pats) {
         auto hits = scanner::FindAll(mod, pat.text, 128);
-        Log("[native] patron '%s' -> %zu coincidencias", pat.text, hits.size());
-
         for (uintptr_t at : hits) {
             const int32_t rel = *reinterpret_cast<int32_t*>(at + 3);
             auto* slot = reinterpret_cast<Reg***>(at + 7 + rel);
-            auto* candidate = pat.indirect ? reinterpret_cast<Reg**>(*slot)
-                                           : reinterpret_cast<Reg**>(slot);
-            if (reinterpret_cast<uintptr_t>(candidate) < 0x10000) continue;
+            uintptr_t raw = reinterpret_cast<uintptr_t>(slot);
+            if (raw < 0x10000) continue;
 
-            // Distribucion A: { next, handler, hash }
-            const int sA = ScoreTable(candidate, 16, 8);
-            if (sA > bestScore) { bestScore = sA; best = candidate; bestHash = 16; bestHandler = 8; }
+            // directo y desreferenciado, con las dos distribuciones de nodo
+            for (int pass = 0; pass < 2; ++pass) {
+                Reg** candidate = pass ? reinterpret_cast<Reg**>(Read64(raw))
+                                       : reinterpret_cast<Reg**>(raw);
+                if (reinterpret_cast<uintptr_t>(candidate) < 0x10000) continue;
 
-            // Distribucion B: { next, hash, handler }
-            const int sB = ScoreTable(candidate, 8, 16);
-            if (sB > bestScore) { bestScore = sB; best = candidate; bestHash = 8; bestHandler = 16; }
+                const int sA = ScoreTable(candidate, 16, 8);
+                if (sA > bestScore) { bestScore = sA; best = candidate; bestHash = 16; bestHandler = 8; }
+
+                const int sB = ScoreTable(candidate, 8, 16);
+                if (sB > bestScore) { bestScore = sB; best = candidate; bestHash = 8; bestHandler = 16; }
+            }
         }
     }
 
     if (!best || bestScore < 3) {
-        LogE("[native] tabla de natives no resuelta (mejor puntuacion %d)", bestScore);
+        LogE("[native] ni invocador ni tabla (mejor puntuacion %d)", bestScore);
         return false;
     }
 
     g_table      = best;
     g_hashOff    = bestHash;
     g_handlerOff = bestHandler;
-    Log("[native] tabla validada en %p (puntuacion %d/%zu, hash+0x%X handler+0x%X)",
-        static_cast<void*>(g_table), bestScore, sizeof(kProbes) / sizeof(kProbes[0]),
-        g_hashOff, g_handlerOff);
-    return true;
-}
-
-bool DetectAbi() {
-    for (const Abi& a : kAbis) {
-        if (!TestAbi(a)) {
-            Log("[native] layout descartado: ret+0x%X args+0x%X", a.ret, a.args);
-            continue;
-        }
-        g_abi = a;
-        Log("[native] layout valido: ret+0x%X argCount+0x%X dataCount+0x%X args+0x%X",
-            a.ret, a.argCount, a.dataCount, a.args);
-        return true;
-    }
-    LogE("[native] ningun layout de contexto paso las pruebas");
-    return false;
+    Log("[native] tabla en %p (puntuacion %d/%zu)", static_cast<void*>(g_table),
+        bestScore, sizeof(kProbes) / sizeof(kProbes[0]));
+    return DetectAbi("tabla");
 }
 } // namespace
 
 namespace native {
 
-bool ready() { return g_table != nullptr && g_nativeOk; }
+bool ready() { return g_nativeOk; }
 bool usingMatrix() { return !g_hasScreen; }
 
 bool esp()  { return g_esp; }
@@ -438,24 +474,40 @@ void setJump(bool v) { g_jump = v; }
 void setFov(float v) { g_fov = v; }
 
 bool init() {
-    if (g_table) return true;
-    if (!Resolve()) return false;
-
-    if (!DetectAbi()) {
+    if (g_nativeOk) return true;
+    if (!Resolve()) {
         g_table = nullptr;
-        LogE("[native] tabla descartada, natives desactivados");
+        g_invoker = nullptr;
         return false;
     }
 
-    g_hasScreen = Get(N_SCREEN) != nullptr;
-    Log("[native] native de pantalla %s", g_hasScreen ? "disponible" : "ausente, se usa matriz");
+    g_hasScreen = false;
+    int me = -1;
+    __try {
+        me = static_cast<int>(Call(N_PLAYER_ID));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        me = -1;
+    }
+
+    if (me >= 0) {
+        uint64_t h = 0;
+        __try {
+            h = Call(N_SCREEN, 0.0f, 0.0f, 0.0f, &me, &me);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            h = 0;
+        }
+        g_hasScreen = Get(N_SCREEN) != nullptr;
+    }
 
     g_nativeOk = true;
+    Log("[native] listo (modo %s, pantalla %s)", g_mode == MODE_INVOKER ? "invocador" : "tabla",
+        g_hasScreen ? "native" : "matriz");
     return true;
 }
 
 void shutdown() {
     g_table = nullptr;
+    g_invoker = nullptr;
     g_nativeOk = false;
 }
 

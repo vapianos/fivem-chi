@@ -16,48 +16,38 @@
 namespace {
 
 using lua_pushcclosure_t = void (*)(lua_State*, int (*)(lua_State*), int);
-using lua_setglobal_t    = void (*)(lua_State*, const char*);
-using lua_getglobal_t    = int  (*)(lua_State*, const char*);
 using lua_pcallk_t       = int  (*)(lua_State*, int, int, int, intptr_t, void*);
 using lua_loadbufferx_t  = int  (*)(lua_State*, const char*, size_t, const char*, const char*);
 using lua_tolstring_t    = const char* (*)(lua_State*, int, size_t*);
 using lua_pushstring_t   = const char* (*)(lua_State*, const char*);
 using lua_pushinteger_t  = void (*)(lua_State*, long long);
-using lua_pushboolean_t  = void (*)(lua_State*, int);
-using lua_pushnil_t      = void (*)(lua_State*);
 using lua_createtable_t  = void (*)(lua_State*, int, int);
 using lua_setfield_t     = void (*)(lua_State*, int, const char*);
 using lua_gettop_t       = int  (*)(lua_State*);
 using lua_settop_t       = void (*)(lua_State*, int);
-using lua_type_t         = int  (*)(lua_State*, int);
 
-// Lua 5.4: lua_setglobal(L, k) es exactamente lua_setfield(L, LUA_GLOBALSINDEX, k).
-// -1001002 es LUA_GLOBALSINDEX con LUAI_MAXSTACK por defecto, asi el globals se
-// toca con setfield y no dependemos de firmas que cambian entre builds.
+// lua_setglobal(L, k) == lua_setfield(L, LUA_GLOBALSINDEX, k) en 5.4.
 constexpr int kGlobalsIndex = -1001002;
 
 struct LuaApi {
     lua_loadbufferx_t  loadbufferx = nullptr;
     lua_pcallk_t       pcallk      = nullptr;
     lua_pushstring_t   pushstring  = nullptr;
-    lua_setglobal_t    setglobal   = nullptr;   // opcional, no se usa
-    lua_getglobal_t    getglobal   = nullptr;   // opcional, no se usa
     lua_createtable_t  createtable = nullptr;
     lua_setfield_t     setfield    = nullptr;
     lua_pushcclosure_t pushcclosure = nullptr;
     lua_tolstring_t    tolstring   = nullptr;
     lua_pushinteger_t  pushinteger = nullptr;
-    lua_pushboolean_t  pushboolean = nullptr;
-    lua_pushnil_t      pushnil     = nullptr;
     lua_gettop_t       gettop      = nullptr;
     lua_settop_t       settop      = nullptr;
-    lua_type_t         type        = nullptr;
 
-    // setglobal/getglobal quedan fuera: en 3889 sus firmas no existen.
+    // Ncleo para ejecutar scripts.
     bool ok() const {
-        return loadbufferx && pcallk && pushstring &&
-               createtable && setfield && pushcclosure && tolstring &&
-               pushinteger && pushboolean && pushnil && gettop && settop && type;
+        return loadbufferx && pcallk && tolstring && gettop && settop;
+    }
+    // Extra para exponer la tabla `cheat`.
+    bool canRegister() const {
+        return ok() && createtable && setfield && pushcclosure && pushinteger && pushstring;
     }
 };
 
@@ -69,16 +59,14 @@ struct Sig {
 };
 
 LuaApi            g_api;
-// recursivo: RunString puede reentrar (un script que hace load()) y el lock
-// se toma alrededor de la llamada a Lua.
 std::recursive_mutex g_mutex;
 lua_State*        g_state = nullptr;
 bool              g_ready = false;
 std::vector<std::pair<std::string, std::string>> g_pending;
 
-// Modulos donde vive de verdad el runtime Lua de FiveM, por prioridad.
 const char* kLuaModules[] = {
     "citizen-scripting-lua",
+    "citizen-scripting-core",
     "gta5",
     "gtaprocess",
     "adhesive",
@@ -94,9 +82,20 @@ bool Preferred(const std::string& name) {
     return false;
 }
 
-// Prioriza modulos conocidos y, dentro de cada uno, acepta el primer hit:
-// exigir unicidad absoluta descarta modulos validos (hay firmas con 8 hits).
-uintptr_t FindAnywhere(const char* pattern) {
+// 1) por nombre exportado: si el modulo los exporta, es exacto y no depende
+//    de firmas que cambian de build.
+uintptr_t FindExport(const char* name) {
+    for (auto& m : modules::All()) {
+        HMODULE h = reinterpret_cast<HMODULE>(m.base);
+        if (!h) continue;
+        if (auto p = GetProcAddress(h, name))
+            return reinterpret_cast<uintptr_t>(p);
+    }
+    return 0;
+}
+
+// 2) por patron, priorizando modulos conocidos.
+uintptr_t FindPattern(const char* pattern) {
     auto mods = modules::All();
 
     std::vector<ModuleInfo> ordered;
@@ -111,38 +110,37 @@ uintptr_t FindAnywhere(const char* pattern) {
     return 0;
 }
 
+uintptr_t Find(const Sig& sig) {
+    if (uintptr_t hit = FindExport(sig.name)) return hit;
+    return FindPattern(sig.pattern);
+}
+
 bool Resolve() {
     static const Sig sigs[] = {
         { "luaL_loadbufferx", "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 30", (void**)&g_api.loadbufferx, false },
         { "lua_pcallk",       "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83 EC 20", (void**)&g_api.pcallk, false },
-        { "lua_pushstring",   "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B D9 48 85 D2 75", (void**)&g_api.pushstring, false },
-        { "lua_createtable",  "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B F1 48 8B D9 48 63 FA 48 85 D2 7F", (void**)&g_api.createtable, false },
-        { "lua_setfield",     "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B D9 48 85 D2 74 1E 48 8B F2", (void**)&g_api.setfield, false },
-        { "lua_pushcclosure", "48 89 5C 24 08 48 89 74 24 10 48 89 7C 24 18 41 56 48 83 EC 20 48 8B D9 48 8B FA 48 63 F1", (void**)&g_api.pushcclosure, false },
         { "lua_tolstring",    "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 30 48 8B E9", (void**)&g_api.tolstring, false },
-        { "lua_pushinteger",  "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B D9 48 8B F2 48 85 D2", (void**)&g_api.pushinteger, false },
-        { "lua_pushboolean",  "48 89 5C 24 08 57 48 83 EC 20 48 8B D9 8B FA 85 D2 74 04", (void**)&g_api.pushboolean, false },
-        { "lua_pushnil",      "48 89 5C 24 08 57 48 83 EC 20 48 8B D9 48 8B 49 10 48 8B 41 08", (void**)&g_api.pushnil, false },
         { "lua_gettop",       "48 8B 41 10 48 2B 41 08 48 C1 F8 04 C3", (void**)&g_api.gettop, false },
         { "lua_settop",       "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B F1 48 8B DA 85 D2 78 12", (void**)&g_api.settop, false },
-        { "lua_type",         "48 89 5C 24 08 57 48 83 EC 20 48 8B D9 48 63 FA 48 85 D2 7F 0D", (void**)&g_api.type, false },
-        { "lua_setglobal",    "4C 8B C2 BA D6 B4 F0 FF E9", (void**)&g_api.setglobal, true },
-        { "lua_getglobal",    "4C 8B C2 BA D6 B4 F0 FF E9", (void**)&g_api.getglobal, true },
+        { "lua_pushstring",   "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B D9 48 85 D2 75", (void**)&g_api.pushstring, true },
+        { "lua_createtable",  "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B F1 48 8B D9 48 63 FA 48 85 D2 7F", (void**)&g_api.createtable, true },
+        { "lua_setfield",     "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B D9 48 85 D2 74 1E 48 8B F2", (void**)&g_api.setfield, true },
+        { "lua_pushcclosure", "48 89 5C 24 08 48 89 74 24 10 48 89 7C 24 18 41 56 48 83 EC 20 48 8B D9 48 8B FA 48 63 F1", (void**)&g_api.pushcclosure, true },
+        { "lua_pushinteger",  "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B D9 48 8B F2 48 85 D2", (void**)&g_api.pushinteger, true },
     };
 
     for (auto& sig : sigs) {
-        uintptr_t hit = FindAnywhere(sig.pattern);
+        uintptr_t hit = Find(sig);
         if (!hit) {
             if (sig.optional) Log("firma opcional ausente: %s", sig.name);
             else LogE("firma no encontrada: %s", sig.name);
             continue;
         }
         *sig.slot = reinterpret_cast<void*>(hit);
+        Log("[lua] %s en %p", sig.name, reinterpret_cast<void*>(hit));
     }
     return g_api.ok();
 }
-
-// --- API expuesta a Lua -----------------------------------------------------
 
 int api_log(lua_State* L) {
     size_t len = 0;
@@ -177,11 +175,11 @@ bool init() {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (g_ready) return true;
     if (!Resolve()) {
-        LogE("no se pudieron resolver todas las firmas de Lua");
+        LogE("no se pudieron resolver las firmas de Lua");
         return false;
     }
     g_ready = true;
-    Log("runtime Lua listo");
+    Log("runtime Lua listo%s", g_api.canRegister() ? "" : " (sin tabla cheat)");
     return true;
 }
 
@@ -197,7 +195,7 @@ bool ready() { return g_ready && g_state != nullptr; }
 lua_State* state() { return g_state; }
 
 void RegisterApi(lua_State* L) {
-    if (!L || !g_api.ok()) return;
+    if (!L || !g_api.canRegister()) return;
     const int top = g_api.gettop(L);
     RegisterInternal(L);
     g_api.settop(L, top);
@@ -208,7 +206,7 @@ void OnLoadBuffer(lua_State* L) {
 
     {
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
-        if (g_state == L) return;   // ya registrado
+        if (g_state == L) return;
         g_state = L;
     }
 
