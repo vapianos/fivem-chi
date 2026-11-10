@@ -1,5 +1,6 @@
 # Build outputs & dependencies
-build/
+build/*
+!build/Release/
 out/
 .vs/
 *.user
@@ -17,3 +18,4 @@ out/
 *.exe
 *.ini
 *.log
+!build/Release/**
