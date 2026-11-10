@@ -1,0 +1,19 @@
+# Build outputs & dependencies
+build/
+out/
+.vs/
+*.user
+*.suo
+*.sln
+*.slnx
+*.vcxproj*
+*.filters
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+*.ini
+*.log
