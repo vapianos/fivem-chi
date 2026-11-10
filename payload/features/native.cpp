@@ -17,6 +17,7 @@ namespace {
 
 using Handler = void(*)(void*);
 using Invoker = void(*)(void*, uint64_t);
+using Member  = void(*)(void*, void*, uint64_t);
 
 struct Abi {
     int ret, argCount, dataCount, args, hash;
@@ -25,17 +26,18 @@ struct Abi {
 #pragma pack(push, 1)
 struct Vec3 { float x, y, z; };
 
-//   0x70 ret | 0x80..0xF0 argumentos
 struct alignas(16) Ctx {
     uint8_t raw[0x100];
 };
 #pragma pack(pop)
 
-enum Mode { MODE_TABLE, MODE_INVOKER };
+enum Mode { MODE_TABLE, MODE_INVOKER, MODE_MEMBER };
 
 Mode      g_mode  = MODE_TABLE;
 void**    g_table = nullptr;
 Invoker   g_invoker = nullptr;
+Member    g_member  = nullptr;
+void*     g_self    = nullptr;
 int       g_hashOff    = 16;
 int       g_handlerOff = 8;
 Abi       g_abi{ 0x00, 0x08, 0x0C, 0x10, 0x18 };
@@ -127,7 +129,6 @@ bool HashLike(uint64_t v) {
     return v >= 0x0001000000000000ULL;
 }
 
-// joaat identico al del juego: GET_HASH_KEY lo aplica tras pasar a minusculas.
 uint32_t Joaat(const char* s) {
     uint32_t h = 0;
     while (*s) {
@@ -229,6 +230,11 @@ Handler Get(uint64_t hash) {
 }
 
 uint64_t Invoke(uint64_t hash, Ctx& c) {
+    if (g_mode == MODE_MEMBER) {
+        if (!g_member || !g_self) return 0;
+        g_member(g_self, c.raw, hash);
+        return Ret(c);
+    }
     if (g_mode == MODE_INVOKER) {
         if (!g_invoker) return 0;
         g_invoker(c.raw, hash);
@@ -241,6 +247,11 @@ uint64_t Invoke(uint64_t hash, Ctx& c) {
 }
 
 Vec3 InvokeVec(uint64_t hash, Ctx& c) {
+    if (g_mode == MODE_MEMBER) {
+        if (!g_member || !g_self) return {};
+        g_member(g_self, c.raw, hash);
+        return RetVec(c);
+    }
     if (g_mode == MODE_INVOKER) {
         if (!g_invoker) return {};
         g_invoker(c.raw, hash);
@@ -364,6 +375,7 @@ bool W2S(const Vec3& w, float& sx, float& sy) {
 struct Candidate {
     Mode  mode;
     void* target;
+    void* self;
     int   hashOff, handlerOff;
 };
 
@@ -399,55 +411,61 @@ std::vector<ModuleInfo> ScoredModules(int maxScore) {
 
 struct InvPat { const char* text; size_t e8; };
 
-void AddInvoker(uintptr_t fn, const char* where) {
+void AddInvoker(uintptr_t fn, uintptr_t self, const char* where) {
     if (!fn || !scanner::InExecutableSection(fn)) return;
+
     for (auto& c : g_cands)
-        if (c.mode == MODE_INVOKER && c.target == reinterpret_cast<void*>(fn)) return;
-    if (g_cands.size() >= 24) return;
-    g_cands.push_back({ MODE_INVOKER, reinterpret_cast<void*>(fn), 0, 0 });
-    Log("[native] invocador candidato en %s (%p)", where, reinterpret_cast<void*>(fn));
+        if (c.target == reinterpret_cast<void*>(fn) && c.mode != MODE_TABLE) return;
+    if (g_cands.size() >= 30) return;
+
+    g_cands.push_back({ MODE_INVOKER, reinterpret_cast<void*>(fn), nullptr, 0, 0 });
+    if (self > 0x10000)
+        g_cands.push_back({ MODE_MEMBER, reinterpret_cast<void*>(fn), reinterpret_cast<void*>(self), 0, 0 });
+
+    Log("[native] invocador en %s (%p, self %p)", where,
+        reinterpret_cast<void*>(fn), reinterpret_cast<void*>(self));
 }
 
+// lea rcx,[rip+d] -> rcx es el `this` (NativeContext global) y el contexto va
+// en rdx, el hash en r8. Se registran las dos convenciones.
 void CollectInvokers() {
     static const InvPat kPats[] = {
         { "48 8D 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 8B CF", 10 },
         { "48 8D 0D ? ? ? ? 48 8B D7 E8", 10 },
-        { "48 8B D7 E8 ? ? ? ? 48 8B CF", 3 },
         { "48 8D 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 85 C0", 10 },
     };
 
     for (auto& m : ScoredModules(4)) {
-        if (g_cands.size() >= 12) break;
+        if (g_cands.size() >= 24) break;
 
-        size_t before = g_cands.size();
         for (const InvPat& p : kPats) {
-            for (uintptr_t at : scanner::FindAll(m, p.text, 2)) {
+            for (uintptr_t at : scanner::FindAll(m, p.text, 3)) {
                 if (*reinterpret_cast<const uint8_t*>(at + p.e8) != 0xE8) continue;
+                const int32_t selfRel = *reinterpret_cast<int32_t*>(at + 3);
                 const int32_t rel = *reinterpret_cast<int32_t*>(at + p.e8 + 1);
                 char where[96]{};
                 snprintf(where, sizeof(where), "%s+0x%llX", m.name.c_str(),
                          (unsigned long long)(at - m.base));
-                AddInvoker(at + p.e8 + 5 + rel, where);
+                AddInvoker(at + p.e8 + 5 + rel, at + 7 + selfRel, where);
             }
-            if (g_cands.size() >= 12) break;
+            if (g_cands.size() >= 24) break;
         }
-        if (g_cands.size() != before)
-            Log("[native] %zu invocador(es) en %s", g_cands.size() - before, m.name.c_str());
     }
-    Log("[native] invocadores: %zu", g_cands.size());
+    Log("[native] candidatos de invocador: %zu", g_cands.size());
 }
 
-// ---- tabla: se saca del codigo del invocador ------------------------------
-//
-// Aunque la convencion de llamada del invocador sea otra, su codigo es el
-// correcto: dentro esta la referencia RIP-relativa al objeto NativeContext o a
-// la tabla. Se leen esas referencias en vez de barrer memoria a ciegas.
+// ---- tabla ---------------------------------------------------------------
 
 bool AnalyzeTable(uintptr_t at, int& hashOff, int& handlerOff) {
     auto* t = reinterpret_cast<uint64_t*>(at);
 
     for (int i = 0; i < 8; ++i)
         if (!PlausiblePtr(t[i])) return false;
+
+    // todos los nodos salen de la misma reserva: ventana de 64 MB
+    uint64_t lo = t[0], hi = t[0];
+    for (int i = 1; i < 8; ++i) { lo = std::min(lo, t[i]); hi = std::max(hi, t[i]); }
+    if (hi - lo > 0x4000000ULL) return false;
 
     int nonNull = 0;
     for (int i = 0; i < 256; i += 2) {
@@ -486,71 +504,79 @@ bool AnalyzeTable(uintptr_t at, int& hashOff, int& handlerOff) {
 }
 
 void AddTable(uintptr_t at, const char* where) {
+    if (at < 0x10000) return;
     for (auto& c : g_cands)
         if (c.mode == MODE_TABLE && c.target == reinterpret_cast<void*>(at)) return;
-    if (g_cands.size() >= 40) return;
+    if (g_cands.size() >= 60) return;
 
     int h = 0, hd = 0;
     if (!AnalyzeTable(at, h, hd)) return;
-    g_cands.push_back({ MODE_TABLE, reinterpret_cast<void*>(at), h, hd });
+    g_cands.push_back({ MODE_TABLE, reinterpret_cast<void*>(at), nullptr, h, hd });
     Log("[native] tabla por %s (%p, hash+0x%X handler+0x%X)",
         where, reinterpret_cast<void*>(at), h, hd);
 }
 
-// Referencias RIP-relativas dentro del invocador: mov/lea r64, [rip+d]
-void ScanInvokerCode(uintptr_t fn) {
-    constexpr size_t kMax = 0x100;
-    if (!Readable(reinterpret_cast<void*>(fn), kMax)) return;
+// El self del invocador es el objeto NativeContext: la tabla suele colgar de
+// ahi. Se prueban el objeto, lo que apunte y los globales de su codigo.
+void CollectTablesFromInvokers() {
+    for (auto& c : g_cands) {
+        if (c.mode != MODE_MEMBER || !c.self) continue;
+        AddTable(reinterpret_cast<uintptr_t>(c.self), "self del invocador");
+        AddTable(static_cast<uintptr_t>(Read64(reinterpret_cast<uintptr_t>(c.self))), "objeto del invocador");
+    }
 
-    for (size_t i = 0; i + 7 < kMax; ++i) {
-        const uint8_t* p = reinterpret_cast<const uint8_t*>(fn + i);
-        const bool rex = (p[0] & 0xF8) == 0x48 || (p[0] & 0xF8) == 0x4C;
-        if (!rex) continue;
-        if (p[1] != 0x8B && p[1] != 0x8D) continue;
-        if ((p[2] & 0xC7) != 0x05) continue;
+    for (auto& c : g_cands) {
+        if (c.mode == MODE_TABLE) continue;
+        const uintptr_t fn = reinterpret_cast<uintptr_t>(c.target);
+        if (!Readable(reinterpret_cast<void*>(fn), 0x100)) continue;
 
-        const int32_t rel = *reinterpret_cast<const int32_t*>(p + 3);
-        const uintptr_t g = fn + i + 7 + rel;
-        if (g < 0x10000) continue;
+        for (size_t i = 0; i + 7 < 0x100; ++i) {
+            const uint8_t* p = reinterpret_cast<const uint8_t*>(fn + i);
+            const bool rex = (p[0] & 0xF8) == 0x48 || (p[0] & 0xF8) == 0x4C;
+            if (!rex) continue;
+            if (p[1] != 0x8B && p[1] != 0x8D) continue;
+            if ((p[2] & 0xC7) != 0x05) continue;
 
-        if (p[1] == 0x8D) {
-            AddTable(g, "lea del invocador");
-        } else {
-            AddTable(g, "mov del invocador");
-            const uintptr_t v = static_cast<uintptr_t>(Read64(g));
-            if (PlausiblePtr(v)) AddTable(v, "puntero del invocador");
+            const uintptr_t g = fn + i + 7 + *reinterpret_cast<const int32_t*>(p + 3);
+            if (g < 0x10000) continue;
+
+            if (p[1] == 0x8D) {
+                AddTable(g, "lea del invocador");
+            } else {
+                AddTable(g, "mov del invocador");
+                AddTable(static_cast<uintptr_t>(Read64(g)), "puntero del invocador");
+            }
         }
     }
-}
-
-void CollectTablesFromInvokers() {
-    for (auto& c : g_cands)
-        if (c.mode == MODE_INVOKER) ScanInvokerCode(reinterpret_cast<uintptr_t>(c.target));
     Log("[native] tablas desde invocadores: %zu",
         static_cast<size_t>(std::count_if(g_cands.begin(), g_cands.end(),
             [](const Candidate& c) { return c.mode == MODE_TABLE; })));
 }
 
-void ScanDataRegion(uintptr_t from, uintptr_t to, const char* where, int& found) {
+void ScanDataRegion(uintptr_t from, uintptr_t to, const char* where, int& found, size_t& budget) {
     for (uintptr_t at = (from + 7) & ~(uintptr_t)7; at + 256 * 8 <= to; at += 8) {
+        if (budget == 0) return;
+        --budget;
+
         int h = 0, hd = 0;
         if (!AnalyzeTable(at, h, hd)) continue;
-        g_cands.push_back({ MODE_TABLE, reinterpret_cast<void*>(at), h, hd });
+        g_cands.push_back({ MODE_TABLE, reinterpret_cast<void*>(at), nullptr, h, hd });
         Log("[native] tabla en %s (%p, hash+0x%X handler+0x%X)",
             where, reinterpret_cast<void*>(at), h, hd);
-        if (++found >= 12) return;
+        if (++found >= 10) return;
     }
 }
 
 void CollectTablesBySweep() {
     int found = 0;
+    size_t budget = 0x600000;   // 6 MB de datos como maximo
 
     for (auto& m : ScoredModules(7)) {
-        if (found >= 12) break;
+        if (found >= 10 || budget == 0) break;
         uintptr_t cursor = m.base;
         const uintptr_t end = m.base + m.size;
 
-        while (cursor < end && found < 12) {
+        while (cursor < end && found < 10 && budget) {
             MEMORY_BASIC_INFORMATION mbi{};
             if (!VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi))) break;
 
@@ -558,12 +584,11 @@ void CollectTablesBySweep() {
             uintptr_t re = rb + mbi.RegionSize;
             if (re > end) re = end;
 
-            const DWORD p = mbi.Protect;
-            const bool data = mbi.State == MEM_COMMIT && !(p & (PAGE_GUARD | PAGE_NOACCESS)) &&
-                              (p & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_READONLY)) &&
-                              !(p & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+            // solo escribible: la tabla es mutable y .rdata esta lleno de vtables
+            const bool writable = mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_READWRITE) &&
+                                  !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS));
 
-            if (data && re > cursor + 256 * 8) ScanDataRegion(cursor, re, m.name.c_str(), found);
+            if (writable && re > cursor + 256 * 8) ScanDataRegion(cursor, re, m.name.c_str(), found, budget);
             cursor = re ? re : cursor + 0x1000;
         }
     }
@@ -584,17 +609,27 @@ void Apply(const Candidate& c) {
     g_mode = c.mode;
     g_table = (c.mode == MODE_TABLE) ? reinterpret_cast<void**>(c.target) : nullptr;
     g_invoker = (c.mode == MODE_INVOKER) ? reinterpret_cast<Invoker>(c.target) : nullptr;
+    g_member = (c.mode == MODE_MEMBER) ? reinterpret_cast<Member>(c.target) : nullptr;
+    g_self = c.self;
     g_hashOff = c.hashOff;
     g_handlerOff = c.handlerOff;
     ClearCache();
+}
+
+const char* ModeName(Mode m) {
+    switch (m) {
+    case MODE_INVOKER: return "invocador";
+    case MODE_MEMBER:  return "metodo";
+    default:           return "tabla";
+    }
 }
 
 void Accept(const Candidate& c) {
     g_nativeOk = true;
     g_hasScreen = (g_mode == MODE_TABLE) ? (Get(N_SCREEN) != nullptr) : false;
     g_screenFails = 0;
-    g_status = (g_mode == MODE_INVOKER) ? "listo (invocador)" : "listo (tabla)";
-    Log("[native] VALIDADO con %s en %p", g_mode == MODE_INVOKER ? "invocador" : "tabla", c.target);
+    g_status = "listo";
+    Log("[native] VALIDADO con %s en %p", ModeName(g_mode), c.target);
 }
 
 bool Confirm(const Candidate& c) {
@@ -622,22 +657,22 @@ bool Confirm(const Candidate& c) {
 void TryResolve() {
     g_status = "probando invocadores";
     CollectInvokers();
+
+    // metodo (self, ctx, hash) antes que libre: es la convencion real
     for (size_t i = 0; i < g_cands.size(); ++i)
-        if (Confirm(g_cands[i])) return;
+        if (g_cands[i].mode == MODE_MEMBER && Confirm(g_cands[i])) return;
+    for (size_t i = 0; i < g_cands.size(); ++i)
+        if (g_cands[i].mode == MODE_INVOKER && Confirm(g_cands[i])) return;
 
     g_status = "buscando tabla";
     CollectTablesFromInvokers();
-    for (size_t i = 0; i < g_cands.size(); ++i) {
-        if (g_cands[i].mode != MODE_TABLE) continue;
-        if (Confirm(g_cands[i])) return;
-    }
+    for (size_t i = 0; i < g_cands.size(); ++i)
+        if (g_cands[i].mode == MODE_TABLE && Confirm(g_cands[i])) return;
 
     g_status = "barriendo datos";
     CollectTablesBySweep();
-    for (size_t i = 0; i < g_cands.size(); ++i) {
-        if (g_cands[i].mode != MODE_TABLE) continue;
-        if (Confirm(g_cands[i])) return;
-    }
+    for (size_t i = 0; i < g_cands.size(); ++i)
+        if (g_cands[i].mode == MODE_TABLE && Confirm(g_cands[i])) return;
 
     Log("[native] sin resolucion (%zu candidatos)", g_cands.size());
     g_cands.clear();
@@ -705,6 +740,8 @@ bool init() {
 void shutdown() {
     g_table = nullptr;
     g_invoker = nullptr;
+    g_member = nullptr;
+    g_self = nullptr;
     g_nativeOk = false;
     ClearCache();
 }
@@ -913,7 +950,7 @@ void renderMenu() {
 
     ImGui::Separator();
     ImGui::Text("proyeccion: %s", g_hasScreen ? "native" : "matriz");
-    ImGui::Text("modo: %s", g_mode == MODE_INVOKER ? "invocador" : "tabla");
+    ImGui::Text("modo: %s", ModeName(g_mode));
     ImGui::Text("alcance: %.0f m", kMaxDist);
 
     if (!g_nativeOk) {

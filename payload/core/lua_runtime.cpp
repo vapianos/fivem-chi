@@ -26,7 +26,6 @@ using lua_setfield_t     = void (*)(lua_State*, int, const char*);
 using lua_gettop_t       = int  (*)(lua_State*);
 using lua_settop_t       = void (*)(lua_State*, int);
 
-// lua_setglobal(L, k) == lua_setfield(L, LUA_GLOBALSINDEX, k) en 5.4.
 constexpr int kGlobalsIndex = -1001002;
 
 struct LuaApi {
@@ -56,50 +55,20 @@ struct Sig {
     bool optional;
 };
 
-LuaApi            g_api;
+LuaApi               g_api;
 std::recursive_mutex g_mutex;
-lua_State*        g_state = nullptr;
-bool              g_ready = false;
+lua_State*           g_state = nullptr;
+bool                 g_ready = false;
 std::vector<std::pair<std::string, std::string>> g_pending;
 
-// Solo modulos con "lua" en el nombre: una coincidencia de patron en otro
-// modulo produce una direccion plausible pero falsa, y engancharla mata el
-// juego en cuanto carga un chunk.
 std::vector<ModuleInfo> LuaModules() {
     std::vector<ModuleInfo> out;
     for (auto& m : modules::All()) {
         std::string l = m.name;
         std::transform(l.begin(), l.end(), l.begin(), [](unsigned char c) { return (char)::tolower(c); });
-        if (l.find("lua") == std::string::npos) continue;
-        out.push_back(m);
+        if (l.find("lua") != std::string::npos) out.push_back(m);
     }
-    // citizen-scripting-lua primero
-    std::stable_sort(out.begin(), out.end(), [](const ModuleInfo& a, const ModuleInfo& b) {
-        auto low = [](std::string s) {
-            std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)::tolower(c); });
-            return s;
-        };
-        return low(a.name).find("citizen-scripting-lua") < low(b.name).find("citizen-scripting-lua");
-    });
     return out;
-}
-
-uintptr_t FindExport(const char* name, const std::vector<ModuleInfo>& mods) {
-    for (auto& m : mods) {
-        HMODULE h = reinterpret_cast<HMODULE>(m.base);
-        if (!h) continue;
-        if (auto p = GetProcAddress(h, name))
-            return reinterpret_cast<uintptr_t>(p);
-    }
-    return 0;
-}
-
-uintptr_t FindPattern(const char* pattern, const std::vector<ModuleInfo>& mods) {
-    for (auto& m : mods) {
-        if (uintptr_t hit = scanner::FindIn(m, pattern))
-            return hit;
-    }
-    return 0;
 }
 
 bool Resolve() {
@@ -108,7 +77,30 @@ bool Resolve() {
         LogE("[lua] ningun modulo con \"lua\" en el nombre");
         return false;
     }
-    Log("[lua] %zu modulos candidatos", mods.size());
+
+    // El modulo que exporta luaL_loadbufferx es el que lleva el Lua real: todas
+    // las demas funciones se sacan de ahi por export, no por patron.
+    HMODULE host = nullptr;
+    for (auto& m : mods) {
+        HMODULE h = reinterpret_cast<HMODULE>(m.base);
+        if (h && GetProcAddress(h, "luaL_loadbufferx")) { host = h; break; }
+    }
+    if (!host) {
+        LogE("[lua] ningun modulo exporta luaL_loadbufferx");
+        return false;
+    }
+    Log("[lua] modulo anfitrion %p", reinterpret_cast<void*>(host));
+
+    auto byName = [&](const char* n) -> uintptr_t {
+        return reinterpret_cast<uintptr_t>(GetProcAddress(host, n));
+    };
+    auto byPattern = [&](const char* n, const char* pat) -> uintptr_t {
+        for (auto& m : mods) {
+            if (reinterpret_cast<HMODULE>(m.base) != host) continue;
+            return scanner::FindIn(m, pat);
+        }
+        return 0;
+    };
 
     static const Sig sigs[] = {
         { "luaL_loadbufferx", "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 30", (void**)&g_api.loadbufferx, false },
@@ -124,8 +116,8 @@ bool Resolve() {
     };
 
     for (auto& sig : sigs) {
-        uintptr_t hit = FindExport(sig.name, mods);
-        if (!hit) hit = FindPattern(sig.pattern, mods);
+        uintptr_t hit = byName(sig.name);
+        if (!hit) hit = byPattern(sig.name, sig.pattern);
         if (!hit) {
             if (sig.optional) Log("firma opcional ausente: %s", sig.name);
             else LogE("firma no encontrada: %s", sig.name);
