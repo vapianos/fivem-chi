@@ -178,12 +178,12 @@ static DWORD WINAPI UnloadThread(LPVOID) {
     return 0;
 }
 
-// Lua y el hook de loadbufferx escanean todos los modulos: fuera del hilo de arranque.
+// Cada reintento reescanea modulos: no conviene pasar de 4.
 static DWORD WINAPI LuaThread(LPVOID) {
     bool ok = false;
-    for (int i = 0; i < 20 && !ok; ++i) {
+    for (int i = 0; i < 4 && !ok; ++i) {
         ok = lua::init();
-        if (!ok) Sleep(1500);
+        if (!ok) Sleep(2000);
     }
     if (!ok) { BootMark("lua fallo"); return 0; }
 
@@ -237,7 +237,7 @@ static DWORD WINAPI Init(LPVOID) {
     }
     BootMark(armed ? "overlay armado" : "overlay fallo");
 
-    // El escaneo corre en su propio hilo; la validacion la hace el render.
+    // El escaneo corre en su hilo; la validacion la hace el render.
     if (window) Stage("native_scan", [] { native::init(); });
     if (mhook)  CloseHandle(CreateThread(nullptr, 0, LuaThread, nullptr, 0, nullptr));
 

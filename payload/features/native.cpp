@@ -46,7 +46,6 @@ unsigned  g_ticks = 0;
 
 std::atomic<bool>  g_esp{ true }, g_box{ true }, g_aim{ false }, g_god{ false }, g_jump{ false };
 std::atomic<bool>  g_skel{ true }, g_aimHold{ false };
-std::atomic<bool>  g_resolving{ false };
 std::atomic<bool>  g_scanStarted{ false };
 std::atomic<bool>  g_scanDone{ false };
 std::atomic<float> g_fov{ 90.0f };
@@ -60,6 +59,7 @@ constexpr float kMaxDist  = 500.0f;
 constexpr float kSkelDist = 300.0f;
 constexpr float kAimDist  = 300.0f;
 
+constexpr uint64_t N_HASH_KEY       = 0xD24D37CC275948CC;
 constexpr uint64_t N_PLAYER_PED_ID  = 0xD80958FC74E988A6;
 constexpr uint64_t N_PLAYER_ID      = 0x4F8644AF03D0E0D6;
 constexpr uint64_t N_GET_PLAYER_PED = 0x43A66C31C68491C0;
@@ -68,6 +68,7 @@ constexpr uint64_t N_COORDS         = 0x3FEF770D40960D5A;
 constexpr uint64_t N_SCREEN         = 0x34E82F05DF2974F5;
 constexpr uint64_t N_HEALTH         = 0xEEF059FAD016D209;
 constexpr uint64_t N_INVINCIBLE     = 0xB7A628320EFF8E47;
+constexpr uint64_t N_ENTITY_INV     = 0x8DC959DA5A9B4A6D;
 constexpr uint64_t N_SUPERJUMP      = 0x8AA4643CD9E6D3B7;
 constexpr uint64_t N_HEADING        = 0xE83D4F9BA2A38914;
 constexpr uint64_t N_CAM_HEADING    = 0xDFC5209B5B4D0F2E;
@@ -78,8 +79,6 @@ constexpr uint64_t N_CAM_COORD      = 0x14D6F5678D8F1B37;
 constexpr uint64_t N_CAM_ROT        = 0x837765A25378F0BB;
 constexpr uint64_t N_CAM_FOV        = 0x65019750A0324133;
 
-// Indices de hueso de ped de GTA V. Si el modelo no tiene el hueso, la
-// coordenada sale (0,0,0) y el enlace se descarta solo.
 enum Bone : int {
     B_Head = 0, B_Neck = 1, B_Spine3 = 2, B_Spine2 = 3, B_Spine1 = 4, B_Spine0 = 5, B_Pelvis = 6,
     B_LClav = 7, B_RClav = 8,
@@ -118,6 +117,22 @@ bool Readable(const void* p, size_t len) {
            reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
 }
 
+// joaat identico al del juego: GET_HASH_KEY lo aplica tras pasar a minusculas.
+uint32_t Joaat(const char* s) {
+    uint32_t h = 0;
+    while (*s) {
+        char c = *s++;
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        h += (uint8_t)c;
+        h += (h << 10);
+        h ^= (h >> 6);
+    }
+    h += (h << 3);
+    h ^= (h >> 11);
+    h += (h << 15);
+    return h;
+}
+
 void Begin(Ctx& c, uint64_t hash) {
     memset(c.raw, 0, sizeof(c.raw));
     void* args = c.raw + 0x80;
@@ -138,11 +153,12 @@ void PushRaw(Ctx& c, void* v) {
     memcpy(c.raw + g_abi.argCount, &n, 4);
 }
 
-void Push(Ctx& c, int v)    { PushRaw(c, (void*)(intptr_t)v); }
-void Push(Ctx& c, bool v)   { PushRaw(c, (void*)(intptr_t)(v ? 1 : 0)); }
-void Push(Ctx& c, float v)  { uint32_t b; memcpy(&b, &v, 4); PushRaw(c, (void*)(uintptr_t)b); }
-void Push(Ctx& c, void* p)  { PushRaw(c, p); }
-void Push(Ctx& c, float* p) { PushRaw(c, p); }
+void Push(Ctx& c, int v)          { PushRaw(c, (void*)(intptr_t)v); }
+void Push(Ctx& c, bool v)         { PushRaw(c, (void*)(intptr_t)(v ? 1 : 0)); }
+void Push(Ctx& c, float v)        { uint32_t b; memcpy(&b, &v, 4); PushRaw(c, (void*)(uintptr_t)b); }
+void Push(Ctx& c, void* p)        { PushRaw(c, p); }
+void Push(Ctx& c, float* p)       { PushRaw(c, p); }
+void Push(Ctx& c, const char* p)  { PushRaw(c, (void*)p); }
 void Push(Ctx& c, Vec3* v) {
     PushRaw(c, v);
     uint32_t d = 0;
@@ -177,8 +193,6 @@ float AsFloat(uint64_t raw) {
     return f;
 }
 
-// Cache directa: un handler solo entra si esta en seccion ejecutable, asi que
-// un nodo corrupto no llega nunca a llamarse dos veces.
 struct HCache { uint64_t hash; Handler h; };
 HCache g_hcache[256]{};
 
@@ -337,7 +351,7 @@ bool W2S(const Vec3& w, float& sx, float& sy) {
 
 constexpr uint64_t kProbes[] = {
     N_PLAYER_PED_ID, N_PLAYER_ID, N_COORDS, N_HEALTH,
-    N_INVINCIBLE, N_SUPERJUMP, N_NAME, N_CAM_COORD,
+    N_INVINCIBLE, N_SUPERJUMP, N_NAME, N_CAM_COORD, N_HASH_KEY,
 };
 
 bool ProbeTable(void** t, int& hashOff, int& handlerOff) {
@@ -385,6 +399,20 @@ struct Candidate {
 
 std::vector<Candidate> g_cands;
 
+int ModuleScore(const std::string& name) {
+    std::string l = name;
+    std::transform(l.begin(), l.end(), l.begin(), [](unsigned char c) { return (char)::tolower(c); });
+    if (l.find("citizen-scripting-core") != std::string::npos) return 0;
+    if (l.find("gta-core-five") != std::string::npos)        return 1;
+    if (l.find("citizen-scripting-lua") != std::string::npos) return 2;
+    if (l.find("citizen") != std::string::npos)              return 3;
+    if (l.find("lua") != std::string::npos)                  return 4;
+    if (l.find("gta5") != std::string::npos)                 return 5;
+    if (l.find("gtaprocess") != std::string::npos)           return 6;
+    if (l.find("fivem") != std::string::npos)                return 7;
+    return 20;
+}
+
 void AddInvoker(uintptr_t fn) {
     if (!fn || !scanner::InExecutableSection(fn)) return;
     for (auto& c : g_cands)
@@ -393,8 +421,9 @@ void AddInvoker(uintptr_t fn) {
     g_cands.push_back({ MODE_INVOKER, reinterpret_cast<void*>(fn), 0, 0 });
 }
 
-// El envoltorio hace: lea rcx,[ctx] ; mov rdx,rdi ; call <invocador>. Lo que
-// sirve es el DESTINO del call, no el envoltorio.
+// El envoltorio hace: lea rcx,[ctx] ; mov rdx,rdi ; call <invocador>. Sirve el
+// DESTINO del call, no el envoltorio. Se barre TODOS los modulos porque
+// NativeContext::Invoke no vive necesariamente en un modulo de nombre conocido.
 void CollectInvokers() {
     static const char* kPats[] = {
         "48 8D 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 8B CF",
@@ -402,22 +431,27 @@ void CollectInvokers() {
         "48 8B D7 E8 ? ? ? ? 48 8B CF",
     };
 
-    for (auto& m : modules::All()) {
-        std::string n = m.name;
-        std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return (char)::tolower(c); });
-        if (n.find("citizen-scripting-core") == std::string::npos &&
-            n.find("gta-core-five") == std::string::npos &&
-            n.find("citizen-scripting-lua") == std::string::npos) continue;
+    auto mods = modules::All();
+    std::stable_sort(mods.begin(), mods.end(), [](const ModuleInfo& a, const ModuleInfo& b) {
+        return ModuleScore(a.name) < ModuleScore(b.name);
+    });
 
+    for (auto& m : mods) {
+        if (m.size < 0x10000) continue;
+        if (g_cands.size() >= 16) break;
+
+        size_t before = g_cands.size();
         for (const char* pat : kPats) {
-            for (uintptr_t at : scanner::FindAll(m, pat, 4)) {
+            for (uintptr_t at : scanner::FindAll(m, pat, 2)) {
                 const size_t e8 = (pat[3] == '?') ? 10 : 3;
-                const uint8_t op = *reinterpret_cast<const uint8_t*>(at + e8);
-                if (op != 0xE8) continue;
+                if (*reinterpret_cast<const uint8_t*>(at + e8) != 0xE8) continue;
                 const int32_t rel = *reinterpret_cast<int32_t*>(at + e8 + 1);
                 AddInvoker(at + e8 + 5 + rel);
             }
+            if (g_cands.size() >= 16) break;
         }
+        if (g_cands.size() != before)
+            Log("[native] %zu invocador(es) en %s", g_cands.size() - before, m.name.c_str());
     }
 }
 
@@ -440,7 +474,7 @@ void CollectTables() {
                                    : reinterpret_cast<void**>(raw);
                 int h = 0, hd = 0;
                 if (!ProbeTable(cand, h, hd)) continue;
-                if (g_cands.size() >= 16) return;
+                if (g_cands.size() >= 24) return;
                 g_cands.push_back({ MODE_TABLE, cand, h, hd });
                 break;
             }
@@ -450,9 +484,10 @@ void CollectTables() {
 
 void DoScan() {
     CollectInvokers();
-    Log("[native] %zu invocadores candidatos", g_cands.size());
+    Log("[native] invocadores: %zu", g_cands.size());
+    const size_t before = g_cands.size();
     CollectTables();
-    Log("[native] %zu candidatos totales", g_cands.size());
+    Log("[native] tablas: %zu, candidatos: %zu", g_cands.size() - before, g_cands.size());
 }
 
 DWORD WINAPI ScanThread(LPVOID) {
@@ -474,6 +509,9 @@ int       g_stage = 0;
 int       g_streak = 0;
 int       g_me = -1, g_ped = 0;
 ULONGLONG g_retryAt = 0;
+
+char g_probeA[] = "abc";
+char g_probeB[] = "venice";
 
 void Apply(const Candidate& c) {
     g_mode = c.mode;
@@ -502,48 +540,40 @@ bool Reject(const char* why) {
     return false;
 }
 
-// Un paso por frame: nada de bloquear el render.
+// Un paso por frame. La prueba fuerte es GET_HASH_KEY contra joaat calculado
+// aqui: valida binding, ABI, orden de argumentos y paso de strings sin
+// depender de estar en partida.
 bool Step() {
     switch (g_stage) {
     case 0: {
-        int me = -1;
-        __try { me = static_cast<int>(Call(N_PLAYER_ID)); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return Reject("PLAYER_ID lanzo"); }
-        if (me < 0 || me > 32) return Reject("PLAYER_ID fuera de rango");
-        g_me = me;
+        const uint32_t want = Joaat(g_probeA);
+        uint32_t got = 0;
+        __try { got = static_cast<uint32_t>(Call(N_HASH_KEY, g_probeA)); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return Reject("HASH_KEY lanzo"); }
+        if (got != want) return Reject("HASH_KEY no coincide");
         ++g_stage;
         return true;
     }
     case 1: {
-        // PLAYER_PED_ID y GET_PLAYER_PED(PLAYER_ID) tienen que coincidir.
-        int a = 0, b = 0;
-        __try {
-            a = static_cast<int>(Call(N_PLAYER_PED_ID));
-            b = static_cast<int>(Call(N_GET_PLAYER_PED, g_me));
-        } __except (EXCEPTION_EXECUTE_HANDLER) { return Reject("ped lanzo"); }
-        if (a <= 0 || a != b) return Reject("ped inconsistente");
-        g_ped = a;
+        const uint32_t want = Joaat(g_probeB);
+        uint32_t got = 0;
+        __try { got = static_cast<uint32_t>(Call(N_HASH_KEY, g_probeB)); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return Reject("segundo HASH_KEY lanzo"); }
+        if (got != want) return Reject("segundo HASH_KEY no coincide");
         ++g_stage;
         return true;
     }
     case 2: {
-        Vec3 p{};
-        int act = 0, hp = 0;
+        // Ya esta probado el binding; esto solo afina datos de partida.
         __try {
-            act = static_cast<int>(Call(N_ACTIVE, g_me));
-            Call(N_COORDS, g_ped, true, &p);
-            hp = static_cast<int>(Call(N_HEALTH, g_ped));
-        } __except (EXCEPTION_EXECUTE_HANDLER) { return Reject("coords/salud lanzaron"); }
-        if (!act) return Reject("jugador inactivo");
-        if (fabsf(p.x) > 20000.0f || fabsf(p.y) > 20000.0f || fabsf(p.z) > 8000.0f)
-            return Reject("coords fuera del mundo");
-        if (p.x == 0.0f && p.y == 0.0f) return Reject("coords a cero");
-        if (hp <= 0 || hp > 2000) return Reject("salud absurda");
+            g_me = static_cast<int>(Call(N_PLAYER_ID));
+            g_ped = static_cast<int>(Call(N_PLAYER_PED_ID));
+        } __except (EXCEPTION_EXECUTE_HANDLER) { g_me = -1; g_ped = 0; }
         ++g_stage;
         return true;
     }
     default: {
-        if (++g_streak >= 3) { Accept(g_cands[g_candIdx]); return true; }
+        if (++g_streak >= 2) { Accept(g_cands[g_candIdx]); return true; }
         return true;
     }
     }
@@ -645,14 +675,17 @@ void tick() {
         const int me = static_cast<int>(Call(N_PLAYER_ID));
         if (me < 0 || me > 32) return;
 
-        if (g_god)  Call(N_INVINCIBLE, me, true);
+        const int selfPed = static_cast<int>(Call(N_PLAYER_PED_ID));
+
+        if (g_god) {
+            Call(N_INVINCIBLE, me, true);
+            if (selfPed) Call(N_ENTITY_INV, selfPed, true);
+        }
         if (g_jump) Call(N_SUPERJUMP, me);
 
-        if (!g_aim) return;
+        if (!g_aim || !selfPed) return;
         if (g_aimHold && !(GetAsyncKeyState(VK_RBUTTON) & 0x8000)) return;
 
-        const int selfPed = static_cast<int>(Call(N_PLAYER_PED_ID));
-        if (!selfPed) return;
         const Vec3 self = Coords(selfPed);
         if (self.x == 0.0f && self.y == 0.0f) return;
 

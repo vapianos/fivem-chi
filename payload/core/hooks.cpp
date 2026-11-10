@@ -31,19 +31,12 @@ int hk_loadbufferx(void* L, const char* buff, size_t size, const char* name, con
     return o_loadbufferx(L, buff, size, name, mode);
 }
 
-// Orden de preferencia: el runtime Lua de FiveM primero. "Interesting" solo
-// sirve de comodin, no como criterio unico.
-int ModulePriority(const std::string& n) {
+// Solo citizen-scripting-lua: enganchar una coincidencia de otro modulo deja el
+// juego muerto en la siguiente carga de chunk.
+bool IsLuaModule(const std::string& n) {
     std::string l = n;
     std::transform(l.begin(), l.end(), l.begin(), [](unsigned char c) { return (char)::tolower(c); });
-
-    if (l.find("citizen-scripting-lua") != std::string::npos) return 0;
-    if (l.find("gtaprocess") != std::string::npos)           return 1;
-    if (l.find("gta5") != std::string::npos)                 return 2;
-    if (l.find("adhesive") != std::string::npos)             return 3;
-    if (l.find("citizen") != std::string::npos)              return 4;
-    if (l.find("fivem") != std::string::npos)                return 5;
-    return 100;
+    return l.find("citizen-scripting-lua") != std::string::npos;
 }
 } // namespace
 
@@ -52,7 +45,6 @@ namespace hooks {
 bool init() {
     if (g_installed) return true;
 
-    // Sin API de Lua resuelta el hook no aporta nada y solo añade riesgo.
     if (!lua::init()) {
         LogE("[hooks] runtime Lua no disponible, sin hook");
         return false;
@@ -66,28 +58,20 @@ bool init() {
 
     const char* pat = "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 30";
 
-    auto mods = modules::All();
-    std::stable_sort(mods.begin(), mods.end(), [](const ModuleInfo& a, const ModuleInfo& b) {
-        return ModulePriority(a.name) < ModulePriority(b.name);
-    });
+    for (auto& m : modules::All()) {
+        if (!IsLuaModule(m.name)) continue;
 
-    for (auto& m : mods) {
-        const int prio = ModulePriority(m.name);
-        if (prio >= 100) continue;
-
-        // Primer hit dentro del modulo prioritario: la unicidad estricta
-        // descartaba citizen-scripting-lua por tener varias coincidencias.
         const uintptr_t at = scanner::FindIn(m, pat);
         if (!at) continue;
 
         g_target = reinterpret_cast<void*>(at);
-        Log("[hooks] luaL_loadbufferx en %s+0x%llX (prio %d)", m.name.c_str(),
-            (unsigned long long)(at - m.base), prio);
+        Log("[hooks] luaL_loadbufferx en %s+0x%llX", m.name.c_str(),
+            (unsigned long long)(at - m.base));
         break;
     }
 
     if (!g_target) {
-        LogE("no se encontro luaL_loadbufferx, se sigue sin hook");
+        LogE("no se encontro luaL_loadbufferx en citizen-scripting-lua, sin hook");
         return false;
     }
 

@@ -41,11 +41,9 @@ struct LuaApi {
     lua_gettop_t       gettop      = nullptr;
     lua_settop_t       settop      = nullptr;
 
-    // Ncleo para ejecutar scripts.
     bool ok() const {
         return loadbufferx && pcallk && tolstring && gettop && settop;
     }
-    // Extra para exponer la tabla `cheat`.
     bool canRegister() const {
         return ok() && createtable && setfield && pushcclosure && pushinteger && pushstring;
     }
@@ -64,28 +62,30 @@ lua_State*        g_state = nullptr;
 bool              g_ready = false;
 std::vector<std::pair<std::string, std::string>> g_pending;
 
-const char* kLuaModules[] = {
-    "citizen-scripting-lua",
-    "citizen-scripting-core",
-    "gta5",
-    "gtaprocess",
-    "adhesive",
-    "citizen-resources-core",
-    "citizen-resources-client",
-};
-
-bool Preferred(const std::string& name) {
-    std::string l = name;
-    std::transform(l.begin(), l.end(), l.begin(), [](unsigned char c) { return (char)::tolower(c); });
-    for (const char* p : kLuaModules)
-        if (l.find(p) != std::string::npos) return true;
-    return false;
+// Solo modulos con "lua" en el nombre: una coincidencia de patron en otro
+// modulo produce una direccion plausible pero falsa, y engancharla mata el
+// juego en cuanto carga un chunk.
+std::vector<ModuleInfo> LuaModules() {
+    std::vector<ModuleInfo> out;
+    for (auto& m : modules::All()) {
+        std::string l = m.name;
+        std::transform(l.begin(), l.end(), l.begin(), [](unsigned char c) { return (char)::tolower(c); });
+        if (l.find("lua") == std::string::npos) continue;
+        out.push_back(m);
+    }
+    // citizen-scripting-lua primero
+    std::stable_sort(out.begin(), out.end(), [](const ModuleInfo& a, const ModuleInfo& b) {
+        auto low = [](std::string s) {
+            std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)::tolower(c); });
+            return s;
+        };
+        return low(a.name).find("citizen-scripting-lua") < low(b.name).find("citizen-scripting-lua");
+    });
+    return out;
 }
 
-// 1) por nombre exportado: si el modulo los exporta, es exacto y no depende
-//    de firmas que cambian de build.
-uintptr_t FindExport(const char* name) {
-    for (auto& m : modules::All()) {
+uintptr_t FindExport(const char* name, const std::vector<ModuleInfo>& mods) {
+    for (auto& m : mods) {
         HMODULE h = reinterpret_cast<HMODULE>(m.base);
         if (!h) continue;
         if (auto p = GetProcAddress(h, name))
@@ -94,28 +94,22 @@ uintptr_t FindExport(const char* name) {
     return 0;
 }
 
-// 2) por patron, priorizando modulos conocidos.
-uintptr_t FindPattern(const char* pattern) {
-    auto mods = modules::All();
-
-    std::vector<ModuleInfo> ordered;
-    ordered.reserve(mods.size());
-    for (auto& m : mods) if (Preferred(m.name)) ordered.push_back(m);
-    for (auto& m : mods) if (!Preferred(m.name)) ordered.push_back(m);
-
-    for (auto& m : ordered) {
+uintptr_t FindPattern(const char* pattern, const std::vector<ModuleInfo>& mods) {
+    for (auto& m : mods) {
         if (uintptr_t hit = scanner::FindIn(m, pattern))
             return hit;
     }
     return 0;
 }
 
-uintptr_t Find(const Sig& sig) {
-    if (uintptr_t hit = FindExport(sig.name)) return hit;
-    return FindPattern(sig.pattern);
-}
-
 bool Resolve() {
+    const auto mods = LuaModules();
+    if (mods.empty()) {
+        LogE("[lua] ningun modulo con \"lua\" en el nombre");
+        return false;
+    }
+    Log("[lua] %zu modulos candidatos", mods.size());
+
     static const Sig sigs[] = {
         { "luaL_loadbufferx", "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 30", (void**)&g_api.loadbufferx, false },
         { "lua_pcallk",       "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83 EC 20", (void**)&g_api.pcallk, false },
@@ -130,7 +124,8 @@ bool Resolve() {
     };
 
     for (auto& sig : sigs) {
-        uintptr_t hit = Find(sig);
+        uintptr_t hit = FindExport(sig.name, mods);
+        if (!hit) hit = FindPattern(sig.pattern, mods);
         if (!hit) {
             if (sig.optional) Log("firma opcional ausente: %s", sig.name);
             else LogE("firma no encontrada: %s", sig.name);
