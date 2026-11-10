@@ -1,5 +1,7 @@
 #pragma once
 
+struct lua_State;
+
 namespace native {
 
 bool ready();
@@ -32,5 +34,8 @@ void tick();
 void render();
 void renderMenu();
 void rearm();
+
+void addLuaFields(lua_State* L);
+void onLuaState(lua_State* L);
 
 } // namespace native

@@ -1,6 +1,7 @@
 #include "core/lua_runtime.h"
 #include "core/module.h"
 #include "core/scanner.h"
+#include "features/native.h"
 #include "utils/log.h"
 #include "utils/paths.h"
 
@@ -40,20 +41,13 @@ struct LuaApi {
     lua_gettop_t       gettop      = nullptr;
     lua_settop_t       settop      = nullptr;
 
-    bool ok() const {
-        return loadbufferx && pcallk && tolstring && gettop && settop;
-    }
+    bool ok() const { return loadbufferx && pcallk && tolstring && gettop && settop; }
     bool canRegister() const {
         return ok() && createtable && setfield && pushcclosure && pushinteger && pushstring;
     }
 };
 
-struct Sig {
-    const char* name;
-    const char* pattern;
-    void** slot;
-    bool optional;
-};
+struct Sig { const char* name; const char* pattern; void** slot; bool optional; };
 
 LuaApi               g_api;
 std::recursive_mutex g_mutex;
@@ -73,28 +67,18 @@ std::vector<ModuleInfo> LuaModules() {
 
 bool Resolve() {
     const auto mods = LuaModules();
-    if (mods.empty()) {
-        LogE("[lua] ningun modulo con \"lua\" en el nombre");
-        return false;
-    }
+    if (mods.empty()) { LogE("[lua] ningun modulo con \"lua\""); return false; }
 
-    // El modulo que exporta luaL_loadbufferx es el que lleva el Lua real: todas
-    // las demas funciones se sacan de ahi por export, no por patron.
     HMODULE host = nullptr;
     for (auto& m : mods) {
         HMODULE h = reinterpret_cast<HMODULE>(m.base);
         if (h && GetProcAddress(h, "luaL_loadbufferx")) { host = h; break; }
     }
-    if (!host) {
-        LogE("[lua] ningun modulo exporta luaL_loadbufferx");
-        return false;
-    }
+    if (!host) { LogE("[lua] ningun modulo exporta luaL_loadbufferx"); return false; }
     Log("[lua] modulo anfitrion %p", reinterpret_cast<void*>(host));
 
-    auto byName = [&](const char* n) -> uintptr_t {
-        return reinterpret_cast<uintptr_t>(GetProcAddress(host, n));
-    };
-    auto byPattern = [&](const char* n, const char* pat) -> uintptr_t {
+    auto byName = [&](const char* n) { return reinterpret_cast<uintptr_t>(GetProcAddress(host, n)); };
+    auto byPattern = [&](const char* pat) -> uintptr_t {
         for (auto& m : mods) {
             if (reinterpret_cast<HMODULE>(m.base) != host) continue;
             return scanner::FindIn(m, pat);
@@ -117,7 +101,7 @@ bool Resolve() {
 
     for (auto& sig : sigs) {
         uintptr_t hit = byName(sig.name);
-        if (!hit) hit = byPattern(sig.name, sig.pattern);
+        if (!hit) hit = byPattern(sig.pattern);
         if (!hit) {
             if (sig.optional) Log("firma opcional ausente: %s", sig.name);
             else LogE("firma no encontrada: %s", sig.name);
@@ -136,23 +120,21 @@ int api_log(lua_State* L) {
     return 0;
 }
 
-int api_version(lua_State* L) {
-    g_api.pushstring(L, "fivem-cheat 1.0");
-    return 1;
-}
-
-int api_getkey(lua_State* L) {
-    g_api.pushinteger(L, GetAsyncKeyState(0x01) & 0x8000 ? 1 : 0);
-    return 1;
-}
+int api_version(lua_State* L) { g_api.pushstring(L, "fivem-cheat 1.0"); return 1; }
+int api_mouse1(lua_State* L) { g_api.pushinteger(L, GetAsyncKeyState(0x01) & 0x8000 ? 1 : 0); return 1; }
 
 void RegisterInternal(lua_State* L) {
-    g_api.createtable(L, 0, 3);
-    g_api.pushcclosure(L, api_log, 0);       g_api.setfield(L, -2, "log");
-    g_api.pushcclosure(L, api_version, 0);   g_api.setfield(L, -2, "version");
-    g_api.pushcclosure(L, api_getkey, 0);    g_api.setfield(L, -2, "mouse1");
+    g_api.createtable(L, 0, 6);
+    g_api.pushcclosure(L, api_log, 0);    g_api.setfield(L, -2, "log");
+    g_api.pushcclosure(L, api_version, 0);g_api.setfield(L, -2, "version");
+    g_api.pushcclosure(L, api_mouse1, 0); g_api.setfield(L, -2, "mouse1");
+    native::addLuaFields(L);
     g_api.setfield(L, kGlobalsIndex, "cheat");
     g_api.settop(L, 0);
+}
+void CallOnLuaStateSafe(lua_State* L) {
+    __try { native::onLuaState(L); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { LogE("excepcion instalando el script"); }
 }
 } // namespace
 
@@ -161,10 +143,7 @@ namespace lua {
 bool init() {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (g_ready) return true;
-    if (!Resolve()) {
-        LogE("no se pudieron resolver las firmas de Lua");
-        return false;
-    }
+    if (!Resolve()) { LogE("no se pudieron resolver las firmas de Lua"); return false; }
     g_ready = true;
     Log("runtime Lua listo%s", g_api.canRegister() ? "" : " (sin tabla cheat)");
     return true;
@@ -178,8 +157,23 @@ void shutdown() {
 }
 
 bool ready() { return g_ready && g_state != nullptr; }
-
 lua_State* state() { return g_state; }
+
+void AddField(lua_State* L, const char* name, int (*fn)(lua_State*)) {
+    if (!L || !fn || !g_api.canRegister()) return;
+    g_api.pushcclosure(L, fn, 0);
+    g_api.setfield(L, -2, name);
+}
+
+const char* GetStringArg(lua_State* L, int idx, size_t& len) {
+    len = 0;
+    if (!g_api.tolstring) return nullptr;
+    return g_api.tolstring(L, idx, &len);
+}
+
+void PushInteger(lua_State* L, long long v) {
+    if (L && g_api.pushinteger) g_api.pushinteger(L, v);
+}
 
 void RegisterApi(lua_State* L) {
     if (!L || !g_api.canRegister()) return;
@@ -191,14 +185,18 @@ void RegisterApi(lua_State* L) {
 void OnLoadBuffer(lua_State* L) {
     if (!L || !g_ready) return;
 
+    bool first = false;
     {
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
-        if (g_state == L) return;
-        g_state = L;
+        if (g_state != L) { g_state = L; first = true; }
     }
+    if (!first) return;
 
     RegisterApi(L);
     Log("estado Lua capturado (%p)", L);
+
+    CallOnLuaStateSafe(L);
+
     FlushPending();
 }
 
@@ -232,10 +230,7 @@ bool RunString(const std::string& code, const std::string& chunkName) {
 
 bool RunFile(const std::filesystem::path& file) {
     std::ifstream in(file, std::ios::binary);
-    if (!in.is_open()) {
-        LogE("no se pudo abrir %s", paths::ToUtf8(file).c_str());
-        return false;
-    }
+    if (!in.is_open()) { LogE("no se pudo abrir %s", paths::ToUtf8(file).c_str()); return false; }
     std::stringstream ss;
     ss << in.rdbuf();
     return RunString(ss.str(), file.filename().string());
@@ -248,12 +243,8 @@ void PushPending(const std::string& name, std::string code) {
 
 void FlushPending() {
     std::vector<std::pair<std::string, std::string>> queue;
-    {
-        std::lock_guard<std::recursive_mutex> lock(g_mutex);
-        queue.swap(g_pending);
-    }
-    for (auto& [name, code] : queue)
-        RunString(code, name);
+    { std::lock_guard<std::recursive_mutex> lock(g_mutex); queue.swap(g_pending); }
+    for (auto& [name, code] : queue) RunString(code, name);
 }
 
 size_t PendingCount() {
