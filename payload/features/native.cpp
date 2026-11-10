@@ -397,10 +397,6 @@ std::vector<ModuleInfo> ScoredModules(int maxScore) {
     return out;
 }
 
-// ---- 1) invocador por patron ----------------------------------------------
-// El offset del E8 va explicito por patron: deducirlo de pat[3] era erroneo
-// (pat[3] es '8', no '?') y dejaba la lista de invocadores siempre vacia.
-
 struct InvPat { const char* text; size_t e8; };
 
 void AddInvoker(uintptr_t fn, const char* where) {
@@ -441,14 +437,16 @@ void CollectInvokers() {
     Log("[native] invocadores: %zu", g_cands.size());
 }
 
-// ---- 2) tabla por estructura ----------------------------------------------
-// Nodo { next, handler, hash } en cualquier orden: se clasifican los tres
-// campos en vez de asumir posiciones.
+// ---- tabla: se saca del codigo del invocador ------------------------------
+//
+// Aunque la convencion de llamada del invocador sea otra, su codigo es el
+// correcto: dentro esta la referencia RIP-relativa al objeto NativeContext o a
+// la tabla. Se leen esas referencias en vez de barrer memoria a ciegas.
 
 bool AnalyzeTable(uintptr_t at, int& hashOff, int& handlerOff) {
     auto* t = reinterpret_cast<uint64_t*>(at);
 
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < 8; ++i)
         if (!PlausiblePtr(t[i])) return false;
 
     int nonNull = 0;
@@ -460,9 +458,7 @@ bool AnalyzeTable(uintptr_t at, int& hashOff, int& handlerOff) {
     }
     if (nonNull < 100) return false;
 
-    int hits[3] = {};
-    const int pairs[3][2] = { { 8, 16 }, { 16, 8 }, { 0, 8 } };
-
+    int hits[2] = {};
     for (int i = 0; i < 256; i += 4) {
         uintptr_t n = static_cast<uintptr_t>(t[i]);
         for (int g = 0; g < 3 && n; ++g) {
@@ -474,27 +470,65 @@ bool AnalyzeTable(uintptr_t at, int& hashOff, int& handlerOff) {
             const bool execA = scanner::InExecutableSection(static_cast<uintptr_t>(a));
             const bool execB = scanner::InExecutableSection(static_cast<uintptr_t>(b));
             if (execA == execB) break;
-
-            const uint64_t hash = execA ? b : a;
-            if (!HashLike(hash)) break;
+            if (!HashLike(execA ? b : a)) break;
 
             ++hits[execA ? 0 : 1];
-            if (PlausiblePtr(Read64(n + (execA ? 0 : 0)))) {}   // next se sigue abajo
             n = static_cast<uintptr_t>(next);
         }
     }
 
-    int bestIdx = -1, best = 0;
-    for (int i = 0; i < 2; ++i)
-        if (hits[i] > best) { best = hits[i]; bestIdx = i; }
+    const int best = std::max(hits[0], hits[1]);
+    if (best < 60) return false;
 
-    if (bestIdx < 0 || best < 60) return false;
-
-    // pairs[0]: handler en +8, hash en +16 (next en +0)
-    // pairs[1]: handler en +16, hash en +8
-    hashOff = pairs[bestIdx][0];
-    handlerOff = pairs[bestIdx][1];
+    hashOff = (hits[0] >= hits[1]) ? 16 : 8;
+    handlerOff = (hits[0] >= hits[1]) ? 8 : 16;
     return true;
+}
+
+void AddTable(uintptr_t at, const char* where) {
+    for (auto& c : g_cands)
+        if (c.mode == MODE_TABLE && c.target == reinterpret_cast<void*>(at)) return;
+    if (g_cands.size() >= 40) return;
+
+    int h = 0, hd = 0;
+    if (!AnalyzeTable(at, h, hd)) return;
+    g_cands.push_back({ MODE_TABLE, reinterpret_cast<void*>(at), h, hd });
+    Log("[native] tabla por %s (%p, hash+0x%X handler+0x%X)",
+        where, reinterpret_cast<void*>(at), h, hd);
+}
+
+// Referencias RIP-relativas dentro del invocador: mov/lea r64, [rip+d]
+void ScanInvokerCode(uintptr_t fn) {
+    constexpr size_t kMax = 0x100;
+    if (!Readable(reinterpret_cast<void*>(fn), kMax)) return;
+
+    for (size_t i = 0; i + 7 < kMax; ++i) {
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(fn + i);
+        const bool rex = (p[0] & 0xF8) == 0x48 || (p[0] & 0xF8) == 0x4C;
+        if (!rex) continue;
+        if (p[1] != 0x8B && p[1] != 0x8D) continue;
+        if ((p[2] & 0xC7) != 0x05) continue;
+
+        const int32_t rel = *reinterpret_cast<const int32_t*>(p + 3);
+        const uintptr_t g = fn + i + 7 + rel;
+        if (g < 0x10000) continue;
+
+        if (p[1] == 0x8D) {
+            AddTable(g, "lea del invocador");
+        } else {
+            AddTable(g, "mov del invocador");
+            const uintptr_t v = static_cast<uintptr_t>(Read64(g));
+            if (PlausiblePtr(v)) AddTable(v, "puntero del invocador");
+        }
+    }
+}
+
+void CollectTablesFromInvokers() {
+    for (auto& c : g_cands)
+        if (c.mode == MODE_INVOKER) ScanInvokerCode(reinterpret_cast<uintptr_t>(c.target));
+    Log("[native] tablas desde invocadores: %zu",
+        static_cast<size_t>(std::count_if(g_cands.begin(), g_cands.end(),
+            [](const Candidate& c) { return c.mode == MODE_TABLE; })));
 }
 
 void ScanDataRegion(uintptr_t from, uintptr_t to, const char* where, int& found) {
@@ -504,20 +538,19 @@ void ScanDataRegion(uintptr_t from, uintptr_t to, const char* where, int& found)
         g_cands.push_back({ MODE_TABLE, reinterpret_cast<void*>(at), h, hd });
         Log("[native] tabla en %s (%p, hash+0x%X handler+0x%X)",
             where, reinterpret_cast<void*>(at), h, hd);
-        if (++found >= 20) return;
+        if (++found >= 12) return;
     }
 }
 
-void CollectTables() {
+void CollectTablesBySweep() {
     int found = 0;
 
-    // a) secciones de datos de modulos Citizen / juego
     for (auto& m : ScoredModules(7)) {
-        if (found >= 20) break;
+        if (found >= 12) break;
         uintptr_t cursor = m.base;
         const uintptr_t end = m.base + m.size;
 
-        while (cursor < end && found < 20) {
+        while (cursor < end && found < 12) {
             MEMORY_BASIC_INFORMATION mbi{};
             if (!VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi))) break;
 
@@ -530,39 +563,11 @@ void CollectTables() {
                               (p & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_READONLY)) &&
                               !(p & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
 
-            if (data && re > cursor + 256 * 8)
-                ScanDataRegion(cursor, re, m.name.c_str(), found);
-
+            if (data && re > cursor + 256 * 8) ScanDataRegion(cursor, re, m.name.c_str(), found);
             cursor = re ? re : cursor + 0x1000;
         }
     }
-
-    // b) memoria reservada: la tabla puede vivir en el heap, no en el modulo
-    if (found == 0) {
-        uintptr_t cursor = 0x10000;
-        int regions = 0;
-        while (cursor < 0x00007FFFFFFE0000ULL && regions < 6000 && found < 20) {
-            MEMORY_BASIC_INFORMATION mbi{};
-            if (!VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi))) {
-                cursor += 0x10000;
-                continue;
-            }
-
-            const uintptr_t rb = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-            const uintptr_t re = rb + mbi.RegionSize;
-
-            if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE &&
-                (mbi.Protect & PAGE_READWRITE) && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
-                mbi.RegionSize >= 256 * 8 && mbi.RegionSize <= 0x100000) {
-                ++regions;
-                ScanDataRegion(rb, re, "heap", found);
-            }
-            cursor = re > cursor ? re : cursor + 0x1000;
-        }
-        Log("[native] regiones de heap revisadas: %d", regions);
-    }
-
-    Log("[native] tablas: %d", found);
+    Log("[native] tablas por barrido: %d", found);
 }
 
 // -------------------------------------------------------------- comprobacion
@@ -592,8 +597,6 @@ void Accept(const Candidate& c) {
     Log("[native] VALIDADO con %s en %p", g_mode == MODE_INVOKER ? "invocador" : "tabla", c.target);
 }
 
-// GET_HASH_KEY("abc") tiene que devolver exactamente joaat("abc"): prueba
-// binding, ABI, orden de argumentos y paso de strings de una sola vez.
 bool Confirm(const Candidate& c) {
     Apply(c);
 
@@ -617,19 +620,27 @@ bool Confirm(const Candidate& c) {
 }
 
 void TryResolve() {
+    g_status = "probando invocadores";
     CollectInvokers();
-    for (size_t i = 0; i < g_cands.size(); ++i) {
+    for (size_t i = 0; i < g_cands.size(); ++i)
         if (Confirm(g_cands[i])) return;
-        Log("[native] invocador %zu descartado", i);
+
+    g_status = "buscando tabla";
+    CollectTablesFromInvokers();
+    for (size_t i = 0; i < g_cands.size(); ++i) {
+        if (g_cands[i].mode != MODE_TABLE) continue;
+        if (Confirm(g_cands[i])) return;
     }
 
-    g_cands.clear();
-    CollectTables();
+    g_status = "barriendo datos";
+    CollectTablesBySweep();
     for (size_t i = 0; i < g_cands.size(); ++i) {
+        if (g_cands[i].mode != MODE_TABLE) continue;
         if (Confirm(g_cands[i])) return;
-        Log("[native] tabla %zu descartada", i);
     }
-    Log("[native] sin resolucion");
+
+    Log("[native] sin resolucion (%zu candidatos)", g_cands.size());
+    g_cands.clear();
 }
 
 DWORD WINAPI ScanThread(LPVOID) {
