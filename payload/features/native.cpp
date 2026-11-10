@@ -74,12 +74,11 @@ constexpr uint64_t N_HEADING        = 0xE83D4F9BA2A38914;
 constexpr uint64_t N_CAM_HEADING    = 0xDFC5209B5B4D0F2E;
 constexpr uint64_t N_CAM_PITCH      = 0x5A4A6A6D;
 constexpr uint64_t N_NAME           = 0x6D0DE6A7B5DA71F8;
-constexpr uint64_t N_BONE           = 0x44A8FCB8ED227738;   // GET_WORLD_POSITION_OF_ENTITY_BONE
+constexpr uint64_t N_BONE           = 0x44A8FCB8ED227738;
 constexpr uint64_t N_CAM_COORD      = 0x14D6F5678D8F1B37;
 constexpr uint64_t N_CAM_ROT        = 0x837765A25378F0BB;
 constexpr uint64_t N_CAM_FOV        = 0x65019750A0324133;
 
-// Cadena del esqueleto: cabeza, cuello, columna y pelvis.
 constexpr int kBones[] = { 0, 1, 2, 5, 8 };
 
 uint64_t Read64(uintptr_t at) {
@@ -304,19 +303,18 @@ constexpr uint64_t kProbes[] = {
     N_INVINCIBLE, N_SUPERJUMP, N_NAME, N_CAM_COORD,
 };
 
-// Recorre TODOS los cubos y busca los hashes conocidos en cualquier offset del
-// nodo, asi no depende ni del indice de cubo ni del orden de campos. No llama
-// a nada, por tanto no consume memoria del juego.
+// Muestreo, no barrido completo: 32 cubos y 4 nodos por cubo. Suficiente para
+// distinguir una tabla real y lo bastante barato para no colgar el arranque.
 bool ProbeTable(Reg** t, int& hashOff, int& handlerOff, int& scoreOut) {
     if (reinterpret_cast<uintptr_t>(t) < 0x10000) return false;
     if (!Readable(t, 256 * sizeof(void*))) return false;
 
     int live = 0;
-    for (int i = 0; i < 256; ++i) {
+    for (int i = 0; i < 256; i += 8) {
         uintptr_t n = reinterpret_cast<uintptr_t>(t[i]);
         if (n && Readable(reinterpret_cast<void*>(n), 24)) ++live;
     }
-    if (live < 16) return false;
+    if (live < 4) return false;
 
     static const int pairs[2][2] = { { 8, 16 }, { 16, 8 } };
     int bestScore = 0, bestHash = 0, bestHandler = 0;
@@ -325,7 +323,7 @@ bool ProbeTable(Reg** t, int& hashOff, int& handlerOff, int& scoreOut) {
         int matched = 0, exec = 0;
         for (int i = 0; i < 256; ++i) {
             uintptr_t n = reinterpret_cast<uintptr_t>(t[i]);
-            for (int g = 0; n && g < 8; ++g) {
+            for (int g = 0; n && g < 4; ++g) {
                 if (!Readable(reinterpret_cast<void*>(n), 24)) break;
                 for (uint64_t probe : kProbes)
                     if (Read64(n + pr[0]) == probe) ++matched;
@@ -429,22 +427,26 @@ bool Resolve() {
     mod.base = g_game;
     mod.size = g_size;
 
-    static const char* kPats[] = {
-        "48 8D 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 8B CF",
-        "48 8D 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 85 C0",
-        "48 8D 0D ? ? ? ? 48 8B D7 E8",
-        "48 8B 0D ? ? ? ? 48 8B D7 E8",
+    struct Pat { const char* text; bool specific; };
+    static const Pat pats[] = {
+        { "48 8D 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 8B CF", true },
+        { "48 8D 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 85 C0", true },
+        { "48 8B 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 8B CF", true },
+        { "48 8D 0D ? ? ? ? 48 8B D7 E8", false },
+        { "48 8B 0D ? ? ? ? 48 8B D7 E8", false },
     };
 
-    // 1) tabla: barrido completo, sin ejecutar nada.
+    // 1) tabla, con presupuesto acotado y corte en cuanto hay algo claro.
     Reg** best = nullptr;
     int   bestScore = 0, bestHash = 0, bestHandler = 0;
+    int   budget = 96;
 
-    for (const char* pat : kPats) {
-        auto hits = scanner::FindAll(mod, pat, 128);
-        Log("[native] patron '%s' -> %zu coincidencias", pat, hits.size());
+    for (const Pat& pat : pats) {
+        auto hits = scanner::FindAll(mod, pat.text, pat.specific ? 8 : 48);
+        Log("[native] patron '%s' -> %zu coincidencias", pat.text, hits.size());
 
         for (uintptr_t at : hits) {
+            if (--budget < 0) break;
             const int32_t rel = *reinterpret_cast<int32_t*>(at + 3);
             const uintptr_t raw = at + 7 + rel;
             if (raw < 0x10000) continue;
@@ -457,6 +459,7 @@ bool Resolve() {
                 if (sc > bestScore) { bestScore = sc; best = candidate; bestHash = h; bestHandler = hd; }
             }
         }
+        if (bestScore >= 24) break;
     }
 
     if (best) {
@@ -471,11 +474,12 @@ bool Resolve() {
         LogE("[native] la tabla no paso las pruebas de contexto");
     }
 
-    // 2) respaldo: invocador, pocos candidatos y con respiro.
+    // 2) respaldo: invocador, maximo 6 y con respiro.
     g_mode = MODE_INVOKER;
     std::vector<uintptr_t> starts;
-    for (const char* pat : kPats) {
-        auto hits = scanner::FindAll(mod, pat, 8);
+    for (const Pat& pat : pats) {
+        if (!pat.specific) continue;
+        auto hits = scanner::FindAll(mod, pat.text, 8);
         for (uintptr_t at : hits) {
             uintptr_t start = FunctionStart(at);
             if (!start || !scanner::InExecutableSection(start)) continue;
@@ -603,17 +607,18 @@ const char* NameOf(int i, int ped, ULONGLONG now) {
 }
 
 void DrawSkeleton(ImDrawList* dl, int ped) {
-    ImVec2 pts[sizeof(kBones) / sizeof(kBones[0])];
-    bool ok[sizeof(kBones) / sizeof(kBones[0])] = {};
+    constexpr size_t n = sizeof(kBones) / sizeof(kBones[0]);
+    ImVec2 pts[n];
+    bool ok[n] = {};
 
-    for (size_t b = 0; b < sizeof(kBones) / sizeof(kBones[0]); ++b) {
+    for (size_t b = 0; b < n; ++b) {
         const Vec3 w = Bone(ped, kBones[b]);
-        float sx, sy;
+        float sx = 0.0f, sy = 0.0f;
         ok[b] = (w.x != 0.0f || w.y != 0.0f) && W2S(w, sx, sy);
         pts[b] = ImVec2(sx, sy);
     }
 
-    for (size_t b = 1; b < sizeof(kBones) / sizeof(kBones[0]); ++b) {
+    for (size_t b = 1; b < n; ++b) {
         if (!ok[b - 1] || !ok[b]) continue;
         dl->AddLine(pts[b - 1], pts[b], IM_COL32(255, 255, 255, 200), 1.4f);
     }

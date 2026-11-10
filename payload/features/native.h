@@ -1,22 +1,30 @@
 #pragma once
 
 namespace native {
+
+bool ready();
+bool usingMatrix();
+
+bool esp();
+bool box();
+bool aim();
+bool god();
+bool jump();
+bool skel();
+float fov();
+
+void setEsp(bool v);
+void setBox(bool v);
+void setAim(bool v);
+void setGod(bool v);
+void setJump(bool v);
+void setSkel(bool v);
+void setFov(float v);
+
 bool init();
 void shutdown();
-bool ready();
-
 void tick();
 void render();
 void renderMenu();
 
-bool  esp();      void setEsp(bool v);
-bool  box();      void setBox(bool v);
-bool  aim();      void setAim(bool v);
-bool  god();      void setGod(bool v);
-bool  jump();     void setJump(bool v);
-bool  skel();     void setSkel(bool v);
-float fov();      void setFov(float v);
-
-// true si el ESP esta proyectando por matriz en vez de por native.
-bool usingMatrix();
-}
+} // namespace native
