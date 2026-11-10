@@ -25,22 +25,19 @@ struct Reg {
     uint64_t hash;
 };
 
+// Layout de scrNativeCallContext: offsets de ret, argCount, dataCount y args.
+struct Abi {
+    int ret, argCount, dataCount, args;
+};
+
 #pragma pack(push, 1)
 struct Vec3 { float x, y, z; };
 
-// scrNativeCallContext del juego. Layout exacto:
-//   0x00 ret | 0x08 argCount | 0x0C dataCount | 0x10 args | 0x18 nativeInit
-//   0x40 en adelante es libre y se usa como almacen.
+// Contexto crudo. No se declara con campos porque el layout se decide en
+// caliente (ver kAbis); los campos se escriben por offset.
+//   0x70 ret | 0x80..0xF0 slots de argumentos
 struct alignas(16) Ctx {
-    void*    ret;
-    uint32_t argCount;
-    uint32_t dataCount;
-    void**   args;
-    uint64_t nativeInit;
-    uint8_t  pad[0x20];
-    void*    slots[32];
-    uint64_t rets[8];
-    Vec3     vecs[8];
+    uint8_t raw[0x100];
 };
 #pragma pack(pop)
 
@@ -49,6 +46,8 @@ uintptr_t g_game  = 0;
 size_t    g_size  = 0;
 int       g_hashOff    = 16;   // offset de hash dentro del nodo
 int       g_handlerOff = 8;    // offset de handler dentro del nodo
+Abi       g_abi{ 0x00, 0x08, 0x0C, 0x10 };
+bool      g_nativeOk  = false;
 bool      g_hasScreen = false;
 int       g_screenFails = 0;
 
@@ -80,18 +79,58 @@ uint64_t Read64(uintptr_t at) {
     return v;
 }
 
-void Begin(Ctx& c) { c = {}; c.args = c.slots; c.ret = c.rets; }
+bool Readable(const void* p, size_t len) {
+    if (!p) return false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(p, &mbi, sizeof(mbi))) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
+    return reinterpret_cast<uintptr_t>(p) + len <=
+           reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+}
 
-void Push(Ctx& c, int v)    { c.args[c.argCount++] = (void*)(intptr_t)v; }
-void Push(Ctx& c, bool v)   { c.args[c.argCount++] = (void*)(intptr_t)(v ? 1 : 0); }
-void Push(Ctx& c, float v)  { uint32_t b; memcpy(&b, &v, 4); c.args[c.argCount++] = (void*)(uintptr_t)b; }
-void Push(Ctx& c, void* p)  { c.args[c.argCount++] = p; }
-void Push(Ctx& c, float* p) { c.args[c.argCount++] = p; }
-void Push(Ctx& c, Vec3* v)  { c.args[c.argCount++] = v; ++c.dataCount; }
+void Begin(Ctx& c) {
+    memset(c.raw, 0, sizeof(c.raw));
+    void* args = c.raw + 0x80;
+    void* ret  = c.raw + 0x70;
+    memcpy(c.raw + g_abi.args, &args, 8);
+    memcpy(c.raw + g_abi.ret,  &ret,  8);
+}
 
-// El handler escribe el retorno en c.rets segun el tipo declarado en el hash.
-// Para natives float el valor ocupa 4 bytes y el resto queda a cero: hay que
-// releerlo como float, nunca castear el uint64.
+void PushRaw(Ctx& c, void* v) {
+    uint32_t n = 0;
+    memcpy(&n, c.raw + g_abi.argCount, 4);
+    void** args = nullptr;
+    memcpy(&args, c.raw + g_abi.args, 8);
+    if (!args || n >= 14) return;
+    args[n] = v;
+    ++n;
+    memcpy(c.raw + g_abi.argCount, &n, 4);
+}
+
+void Push(Ctx& c, int v)    { PushRaw(c, (void*)(intptr_t)v); }
+void Push(Ctx& c, bool v)   { PushRaw(c, (void*)(intptr_t)(v ? 1 : 0)); }
+void Push(Ctx& c, float v)  { uint32_t b; memcpy(&b, &v, 4); PushRaw(c, (void*)(uintptr_t)b); }
+void Push(Ctx& c, void* p)  { PushRaw(c, p); }
+void Push(Ctx& c, float* p) { PushRaw(c, p); }
+void Push(Ctx& c, Vec3* v) {
+    PushRaw(c, v);
+    uint32_t d = 0;
+    memcpy(&d, c.raw + g_abi.dataCount, 4);
+    ++d;
+    memcpy(c.raw + g_abi.dataCount, &d, 4);
+}
+
+uint64_t Ret(const Ctx& c) {
+    void* p = nullptr;
+    memcpy(&p, c.raw + g_abi.ret, 8);
+    uint64_t v = 0;
+    if (p) memcpy(&v, p, 8);
+    return v;
+}
+
+// El handler escribe el retorno segun el tipo declarado en el hash. Para
+// natives float el valor ocupa 4 bytes: hay que releerlo como float.
 float AsFloat(uint64_t raw) {
     float f = 0.0f;
     memcpy(&f, &raw, sizeof(f));
@@ -113,7 +152,7 @@ uint64_t Invoke(uint64_t hash, Ctx& c) {
     Handler h = Get(hash);
     if (!h) return 0;
     h(&c);
-    return c.rets[0];
+    return Ret(c);
 }
 
 template <typename... A>
@@ -254,6 +293,46 @@ int ScoreTable(Reg** t, int hashOff, int handlerOff) {
     return score;
 }
 
+// Layouts candidatos. Solo uno encaja; se comprueban en caliente.
+const Abi kAbis[] = {
+    { 0x00, 0x08, 0x0C, 0x10 },
+    { 0x00, 0x08, 0x0C, 0x18 },
+    { 0x08, 0x10, 0x14, 0x18 },
+    { 0x08, 0x10, 0x14, 0x20 },
+    { 0x00, 0x10, 0x14, 0x18 },
+    { 0x00, 0x18, 0x1C, 0x20 },
+};
+
+// Tres pruebas encadenadas: retorno escalar sin args, retorno con un arg y
+// retorno por vector. Un layout falso falla o revienta en alguna.
+bool TestAbi(const Abi& a) {
+    g_abi = a;
+
+    int me = -1;
+    __try {
+        me = static_cast<int>(Call(N_PLAYER_ID));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    if (me < 0 || me > 32) return false;
+
+    int ped = 0;
+    __try {
+        ped = static_cast<int>(Call(N_GET_PLAYER_PED, me));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    if (ped <= 0) return false;
+
+    Vec3 p{};
+    __try {
+        Call(N_COORDS, ped, true, &p);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return fabsf(p.x) > 0.5f || fabsf(p.y) > 0.5f;
+}
+
 uintptr_t FindGame() {
     ModuleInfo m = modules::Game();
     if (!m.valid()) {
@@ -322,11 +401,26 @@ bool Resolve() {
         g_hashOff, g_handlerOff);
     return true;
 }
+
+bool DetectAbi() {
+    for (const Abi& a : kAbis) {
+        if (!TestAbi(a)) {
+            Log("[native] layout descartado: ret+0x%X args+0x%X", a.ret, a.args);
+            continue;
+        }
+        g_abi = a;
+        Log("[native] layout valido: ret+0x%X argCount+0x%X dataCount+0x%X args+0x%X",
+            a.ret, a.argCount, a.dataCount, a.args);
+        return true;
+    }
+    LogE("[native] ningun layout de contexto paso las pruebas");
+    return false;
+}
 } // namespace
 
 namespace native {
 
-bool ready() { return g_table != nullptr; }
+bool ready() { return g_table != nullptr && g_nativeOk; }
 bool usingMatrix() { return !g_hasScreen; }
 
 bool esp()  { return g_esp; }
@@ -347,36 +441,29 @@ bool init() {
     if (g_table) return true;
     if (!Resolve()) return false;
 
+    if (!DetectAbi()) {
+        g_table = nullptr;
+        LogE("[native] tabla descartada, natives desactivados");
+        return false;
+    }
+
     g_hasScreen = Get(N_SCREEN) != nullptr;
     Log("[native] native de pantalla %s", g_hasScreen ? "disponible" : "ausente, se usa matriz");
 
-    // La tabla ya esta validada: aunque el autotest falle se mantiene, para que
-    // ESP/aimbot puedan reintentar en cuanto haya jugador.
-    for (int i = 0; i < 60; ++i) {
-        const int ped = static_cast<int>(Call(N_PLAYER_PED_ID));
-        if (ped) {
-            const Vec3 p = Coords(ped);
-            if (fabsf(p.x) > 1.0f || fabsf(p.y) > 1.0f) {
-                float sx = 0.0f, sy = 0.0f;
-                Log("[native] autotest ok ped=%d coords=%.1f %.1f %.1f w2s=%d matriz=%d",
-                    ped, p.x, p.y, p.z, W2S(p, sx, sy) ? 1 : 0, usingMatrix() ? 1 : 0);
-                return true;
-            }
-            LogE("[native] autotest: coords nulas para ped %d", ped);
-        }
-        Sleep(500);
-    }
-
-    LogE("[native] autotest fallido, la tabla se conserva");
+    g_nativeOk = true;
     return true;
 }
 
-void shutdown() { g_table = nullptr; }
+void shutdown() {
+    g_table = nullptr;
+    g_nativeOk = false;
+}
 
 void tick() {
-    if (!g_table) return;
+    if (!ready()) return;
 
     const int me = static_cast<int>(Call(N_PLAYER_ID));
+    if (me < 0 || me > 32) return;
     if (g_god)  Call(N_INVINCIBLE, me, true);
     if (g_jump) Call(N_SUPERJUMP, me);
     if (!g_aim) return;
@@ -419,7 +506,7 @@ void tick() {
 }
 
 void render() {
-    if (!g_table || (!g_esp && !g_box)) return;
+    if (!ready() || (!g_esp && !g_box)) return;
     if (!ImGui::GetCurrentContext()) return;
 
     const int me = static_cast<int>(Call(N_PLAYER_ID));
@@ -459,17 +546,23 @@ void render() {
 
         if (g_esp) {
             const char* rawName = reinterpret_cast<const char*>(Call(N_NAME, i));
+            char name[48]{};
+            if (rawName && Readable(rawName, 32)) {
+                memcpy(name, rawName, 31);
+                name[31] = '\0';
+            }
+
             const int hp = static_cast<int>(Call(N_HEALTH, ped));
             char label[160]{};
             snprintf(label, sizeof(label), "%s\n%d hp\n%.0f m",
-                     (rawName && *rawName) ? rawName : "jugador", hp, dist);
+                     name[0] ? name : "jugador", hp, dist);
             dl->AddText(ImVec2(hx + boxW * 0.55f, hy), IM_COL32(0, 255, 128, 255), label);
         }
     }
 }
 
 void renderMenu() {
-    if (!g_table) {
+    if (!ready()) {
         ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "natives no resueltos, revisa el log");
         ImGui::Separator();
     }
