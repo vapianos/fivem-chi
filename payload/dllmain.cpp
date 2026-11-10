@@ -124,8 +124,7 @@ static void WriteDump(EXCEPTION_POINTERS* ep) {
     HMODULE dbg = LoadLibraryW(L"dbghelp.dll");
     if (!dbg) { LogE("sin dbghelp, sin volcado"); return; }
 
-    auto write = reinterpret_cast<MiniDumpWriteDump_t>(
-        GetProcAddress(dbg, "MiniDumpWriteDump"));
+    auto write = reinterpret_cast<MiniDumpWriteDump_t>(GetProcAddress(dbg, "MiniDumpWriteDump"));
     if (!write) { FreeLibrary(dbg); return; }
 
     const std::wstring file = paths::DataDirW() + L"\\crash.dmp";
@@ -182,6 +181,35 @@ static DWORD WINAPI UnloadThread(LPVOID) {
     return 0;
 }
 
+// Los natives se resuelven aparte y con reintentos: al inyectar el jugador
+// puede seguir en carga y PLAYER_ID todavia no devuelve nada valido.
+static DWORD WINAPI NativeThread(LPVOID) {
+    for (int attempt = 0; attempt < 120; ++attempt) {
+        if (native::ready()) return 0;
+        if (native::init()) { BootMark("natives ok"); return 0; }
+        if (attempt == 0) BootMark("natives primer intento fallido");
+        Sleep(attempt < 10 ? 2000 : 5000);
+    }
+    BootMark("natives agotado");
+    LogE("[core] natives sin resolver tras 120 intentos");
+    return 0;
+}
+
+// Lua y el hook de loadbufferx escanean todos los modulos: fuera del hilo de arranque.
+static DWORD WINAPI LuaThread(LPVOID) {
+    bool ok = false;
+    for (int i = 0; i < 20 && !ok; ++i) {
+        ok = lua::init();
+        if (!ok) Sleep(1500);
+    }
+    if (!ok) { BootMark("lua fallo"); return 0; }
+
+    BootMark("lua ok");
+    Stage("hooks", [] { hooks::init(); });
+    if (config::Get().loadOnStart) Stage("scripts", [] { scripts::load_all(); });
+    return 0;
+}
+
 static DWORD WINAPI Init(LPVOID) {
     BootMark("Init arranca");
     Sleep(60);
@@ -208,30 +236,26 @@ static DWORD WINAPI Init(LPVOID) {
 
     bool window = false;
     Stage("ventana", [&] {
-        for (int i = 0; i < 240 && !window; ++i) {
+        for (int i = 0; i < 480 && !window; ++i) {
             window = FindWindowW(L"grcWindow", nullptr) != nullptr;
-            if (!window) Sleep(500);
+            if (!window) Sleep(250);
         }
         BootMark(window ? "ventana encontrada" : "sin ventana en 120s");
-        Sleep(3000);
     });
 
-    // Natives primero: si la tabla no esta lista, el overlay dibuja un frame
-    // vacio por cada Present y luego nunca reintenta.
-    const bool nativeOk = Stage("natives", [] { native::init(); });
-    BootMark(nativeOk ? "natives ok" : "natives fallo");
+    if (!window) BootMark("sin ventana, el overlay no se puede armar");
 
-    const bool overlayOk = Stage("overlay", [] { overlay::init(); });
-    BootMark(overlayOk ? "overlay armado" : "overlay fallo");
-
-    // El runtime Lua se resuelve siempre; el hook solo se instala si hay API.
-    Stage("lua", [] { lua::init(); });
-    if (mhook) Stage("hooks", [] { hooks::init(); });
-
-    if (config::Get().loadOnStart) {
-        Sleep(500);
-        Stage("scripts", [] { scripts::load_all(); });
+    // Overlay PRIMERO: Insert tiene que responder aunque los natives no esten.
+    Sleep(700);
+    bool armed = false;
+    for (int i = 0; i < 40 && !armed; ++i) {
+        armed = Stage("overlay", [] { overlay::init(); });
+        if (!armed) Sleep(500);
     }
+    BootMark(armed ? "overlay armado" : "overlay fallo");
+
+    if (window) CloseHandle(CreateThread(nullptr, 0, NativeThread, nullptr, 0, nullptr));
+    if (mhook)  CloseHandle(CreateThread(nullptr, 0, LuaThread, nullptr, 0, nullptr));
 
     BootMark("listo");
     Log("[core] listo");

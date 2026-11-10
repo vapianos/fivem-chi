@@ -46,6 +46,7 @@ volatile bool     g_shuttingDown = false;
 bool              g_loggedFirst  = false;
 ULONGLONG         g_frames       = 0;
 ULONGLONG         g_autoShowAt   = 0;
+ULONGLONG         g_nextSetupAt  = 0;
 int               g_faults       = 0;
 
 RECT g_savedClip{};
@@ -53,7 +54,8 @@ bool g_hadClip = false;
 
 int PrimaryKey() {
     const int k = config::Get().menuKey;
-    return k ? k : VK_INSERT;
+    if (k < 0x08 || k > 0xFE) return VK_INSERT;
+    return k;
 }
 
 constexpr LONG kQueueSize = 256;
@@ -201,6 +203,7 @@ void HandleKey(int vk) {
     case VK_F3: native::setAim(!native::aim());   Log("aimbot %s", native::aim() ? "on" : "off"); break;
     case VK_F4: native::setGod(!native::god());   Log("godmode %s", native::god() ? "on" : "off"); break;
     case VK_F5: native::setJump(!native::jump()); Log("superjump %s", native::jump() ? "on" : "off"); break;
+    case VK_F6: native::setSkel(!native::skel()); Log("esqueleto %s", native::skel() ? "on" : "off"); break;
     default: break;
     }
 }
@@ -208,7 +211,7 @@ void HandleKey(int vk) {
 void PollKeys() {
     if (g_toggleReq.exchange(false)) ApplyVisible(!g_visible);
 
-    static const int keys[] = { VK_INSERT, VK_F8, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5 };
+    static const int keys[] = { VK_INSERT, VK_F8, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6 };
     static bool down[sizeof(keys) / sizeof(keys[0])]{};
     static bool extraDown = false;
 
@@ -239,7 +242,7 @@ LRESULT CALLBACK hkWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
         case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
         case WM_MBUTTONDOWN: case WM_MBUTTONUP:
-        case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL: case WM_INPUT:
+        case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
             return 0;
         default:
             break;
@@ -293,7 +296,8 @@ bool Setup(IDXGISwapChain* swap) {
         LogE("SetWindowLongPtrW fallo (%lu): se sigue sin WndProc", GetLastError());
     }
 
-    g_autoShowAt = GetTickCount64() + 3000;
+    g_autoShowAt = GetTickCount64() + 1500;
+    g_nextSetupAt = 0;
     g_faults = 0;
     g_ready = true;
     Log("overlay listo, tecla del menu: 0x%02X", PrimaryKey());
@@ -331,8 +335,10 @@ void DrawFrame() {
 
     // Flip model: el backbuffer que deja el juego ya esta presentado. Hay que
     // bindear SIEMPRE el RTV propio, se dibuje menu o solo ESP.
-    g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
-    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    if (g_rtv) {
+        g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    }
 }
 
 HRESULT __stdcall hkPresent(IDXGISwapChain* swap, UINT sync, UINT flags);
@@ -342,7 +348,13 @@ HRESULT PrepareAndDraw(IDXGISwapChain* swap, bool& drew) {
     drew = false;
 
     if (!g_ready) {
-        if (!Setup(swap)) return E_FAIL;
+        // Reintento con espaciado: si falla no se crea/destruye ImGui cada frame.
+        const ULONGLONG now = GetTickCount64();
+        if (now < g_nextSetupAt) return S_OK;
+        if (!Setup(swap)) {
+            g_nextSetupAt = now + 500;
+            return S_OK;
+        }
     }
     if (!g_rtv && !CreateRtv(swap)) return S_OK;
 
@@ -483,7 +495,9 @@ void** GrabVtable() {
     desc.SampleDesc.Count = 1;
     desc.Windowed = TRUE;
     // FLIP_DISCARD: es el modelo que usa FiveM/GTA. Con DISCARD la vtable que
-    // se obtiene puede no ser la misma clase que la del juego.
+    // se obtiene puede no ser la misma clase que la del juego. Ademas con FLIP
+    // el objeto es un IDXGISwapChain1, asi que el indice 22 (Present1) existe
+    // de verdad en la vtable.
     desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
     ID3D11Device* device = nullptr;
@@ -526,8 +540,7 @@ bool CreateSwapChainHook() {
                                 reinterpret_cast<void**>(&o_present));
     const bool okR  = PatchSlot(g_vtable, 13, reinterpret_cast<void*>(&hkResize),
                                 reinterpret_cast<void**>(&o_resize));
-    // Present1 (indice 22) existe en IDXGISwapChain1+: si el juego lo usa, sin
-    // esto el hook nunca dispara.
+    // Present1 (indice 22) solo existe si la vtable es de IDXGISwapChain1+.
     const bool okP1 = (g_vtable[22] && g_vtable[22] != g_vtable[8])
                         ? PatchSlot(g_vtable, 22, reinterpret_cast<void*>(&hkPresent1),
                                     reinterpret_cast<void**>(&o_present1))

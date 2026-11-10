@@ -3,67 +3,58 @@
 #include "utils/log.h"
 #include "utils/paths.h"
 
+#include <filesystem>
 #include <fstream>
 #include <sstream>
-#include <filesystem>
+#include <vector>
+#include <algorithm>
 
 namespace fs = std::filesystem;
 
 namespace scripts {
 
-std::vector<std::string> list() {
-    std::vector<std::string> out;
-    std::error_code ec;
-
-    if (!fs::exists(paths::LuaDir(), ec)) {
-        paths::EnsureDir(paths::LuaDir());
-        return out;
-    }
-
-    for (const auto& entry : fs::directory_iterator(paths::LuaDir(), ec)) {
-        if (!entry.is_regular_file(ec)) continue;
-        if (entry.path().extension() != L".lua") continue;
-        out.push_back(entry.path().filename().string());
-    }
-
-    std::sort(out.begin(), out.end());
-    return out;
-}
-
-bool run(const std::string& fileName) {
-    const fs::path full = paths::LuaDir() / fileName;
-    if (lua::ready())
-        return lua::RunFile(full);
-
-    std::ifstream in(full, std::ios::binary);
-    if (!in.is_open()) {
-        LogE("no se pudo abrir %s", fileName.c_str());
-        return false;
-    }
-    std::stringstream ss;
-    ss << in.rdbuf();
-    lua::PushPending(fileName, ss.str());
-    Log("script en cola: %s", fileName.c_str());
-    return true;
-}
-
 void load_all() {
-    paths::EnsureDir(paths::LuaDir());
-
-    const auto files = list();
-    if (files.empty()) {
-        Log("no hay scripts en %s", paths::ToUtf8(paths::LuaDir()).c_str());
+    std::error_code ec;
+    const fs::path dir = paths::LuaDir();
+    if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec)) {
+        LogE("carpeta de scripts inexistente: %s", paths::ToUtf8(dir).c_str());
         return;
     }
 
-    for (const auto& file : files)
-        run(file);
+    std::vector<fs::path> files;
+    for (auto& entry : fs::directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file(ec)) continue;
+        if (entry.path().extension() != L".lua") continue;
+        files.push_back(entry.path());
+    }
+    std::sort(files.begin(), files.end());
 
-    if (lua::ready())
-        lua::FlushPending();
+    if (files.empty()) {
+        Log("sin scripts .lua en %s", paths::ToUtf8(dir).c_str());
+        return;
+    }
 
-    Log("%zu scripts procesados", files.size());
+    for (const fs::path& file : files) {
+        std::ifstream in(file, std::ios::binary);
+        if (!in.is_open()) {
+            LogE("no se pudo abrir %s", paths::ToUtf8(file).c_str());
+            continue;
+        }
+        std::stringstream ss;
+        ss << in.rdbuf();
+        const std::string name = file.filename().string();
+
+        // Con estado capturado estamos en el hilo del juego solo si venimos del
+        // hook; fuera de el se encola y FlushPending lo ejecuta alli.
+        lua::PushPending(name, ss.str());
+    }
+
+    Log("%zu scripts encolados desde %s", files.size(), paths::ToUtf8(dir).c_str());
+
+    // Si ya hay estado y no estamos en el hilo Lua, RunString se usa solo para
+    // los que quedan pendientes desde la siguiente carga de chunk. Forzamos un
+    // intento inmediato: si falla, quedan en cola.
+    if (lua::ready()) lua::FlushPending();
 }
-
-size_t pending() { return lua::PendingCount(); }
 } // namespace scripts

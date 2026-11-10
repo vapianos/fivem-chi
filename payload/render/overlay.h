@@ -6,4 +6,5 @@ void shutdown();
 bool visible();
 void setVisible(bool state);
 void toggle();
+bool armed();
 }
