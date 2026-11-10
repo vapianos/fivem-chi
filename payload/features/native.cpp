@@ -18,14 +18,12 @@ namespace {
 using Handler  = void(*)(void*);
 using Invoker  = void(*)(void*, uint64_t);
 
-// Nodo de la tabla de registro (solo si se usa el modo tabla).
 struct Reg {
     Reg*     next;
     Handler  handler;
     uint64_t hash;
 };
 
-// Offsets dentro de scrNativeCallContext.
 struct Abi {
     int ret, argCount, dataCount, args, hash;
 };
@@ -52,9 +50,14 @@ Abi       g_abi{ 0x00, 0x08, 0x0C, 0x10, 0x18 };
 bool      g_nativeOk  = false;
 bool      g_hasScreen = false;
 int       g_screenFails = 0;
+unsigned  g_ticks = 0;
 
 std::atomic<bool>  g_esp{ true }, g_box{ true }, g_aim{ false }, g_god{ false }, g_jump{ false };
 std::atomic<float> g_fov{ 90.0f };
+
+// Nombre cacheado: GET_PLAYER_NAME reserva en el heap del juego.
+struct NameCache { int ped = 0; ULONGLONG at = 0; char name[32]{}; };
+NameCache g_names[32];
 
 constexpr float kDeg = 0.01745329252f;
 
@@ -237,7 +240,7 @@ bool W2SMatrix(const Vec3& w, float& sx, float& sy) {
 }
 
 bool W2S(const Vec3& w, float& sx, float& sy) {
-    if (!g_table && !g_invoker) return false;
+    if (!g_nativeOk) return false;
 
     if (g_hasScreen) {
         float x = 0.0f, y = 0.0f;
@@ -288,7 +291,6 @@ int ScoreTable(Reg** t, int hashOff, int handlerOff) {
     return score;
 }
 
-// Layouts candidatos de scrNativeCallContext.
 const Abi kAbis[] = {
     { 0x00, 0x08, 0x0C, 0x10, 0x18 },
     { 0x00, 0x08, 0x0C, 0x18, 0x10 },
@@ -298,7 +300,7 @@ const Abi kAbis[] = {
     { 0x00, 0x08, 0x0C, 0x20, 0x18 },
 };
 
-// Tres pruebas encadenadas: escalar sin args, un arg y retorno por vector.
+// Solo natives sin reservas: PLAYER_ID, PLAYER_PED_ID y coords.
 bool TestAbi(const Abi& a) {
     g_abi = a;
 
@@ -327,8 +329,10 @@ bool TestAbi(const Abi& a) {
     return fabsf(p.x) > 0.5f || fabsf(p.y) > 0.5f;
 }
 
-bool DetectAbi(const char* what) {
+bool DetectAbi(const char* what, int maxAttempts) {
+    int tries = 0;
     for (const Abi& a : kAbis) {
+        if (tries++ >= maxAttempts) break;
         if (!TestAbi(a)) continue;
         Log("[native] contexto valido con %s (ret+0x%X args+0x%X)", what, a.ret, a.args);
         return true;
@@ -336,9 +340,6 @@ bool DetectAbi(const char* what) {
     return false;
 }
 
-// Retrocede hasta el inicio de la funcion que contiene el `lea rcx,[tabla]`.
-// Se apoya en relleno int3 o en prologos conocidos, y se valida luego con
-// TestAbi, asi que un falso positivo se descarta solo.
 uintptr_t FunctionStart(uintptr_t hit) {
     static const uint8_t kProl[] = { 0x48, 0x89, 0x5C, 0x24, 0x08 };
 
@@ -368,7 +369,6 @@ uintptr_t FindGame() {
     return m.base;
 }
 
-// Devuelve true si ha dejado un modo de invocacion funcionando.
 bool Resolve() {
     g_game = FindGame();
     if (!g_game) return false;
@@ -377,20 +377,18 @@ bool Resolve() {
     mod.base = g_game;
     mod.size = g_size;
 
-    struct Pat { const char* text; bool indirect; };
-    static const Pat pats[] = {
-        { "48 8D 0D ? ? ? ? 48 8B D7 E8", false },
-        { "48 8D 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 8B CF", false },
-        { "48 8D 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 85 C0", false },
-        { "48 8B 0D ? ? ? ? 48 8B D7 E8", true },
-        { "48 8B 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 8B CF", true },
+    // Solo los patrones especificos para el invocador: los genericos dan 128
+    // candidatas y cada intento equivocado reserva en el heap del juego.
+    static const char* kSpecific[] = {
+        "48 8D 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 8B CF",
+        "48 8D 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 85 C0",
+        "48 8B 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 8B CF",
     };
 
-    // 1) invocador: no necesita la tabla, la busqueda la hace el propio juego.
     std::vector<uintptr_t> starts;
-    for (const Pat& pat : pats) {
-        auto hits = scanner::FindAll(mod, pat.text, 128);
-        Log("[native] patron '%s' -> %zu coincidencias", pat.text, hits.size());
+    for (const char* pat : kSpecific) {
+        auto hits = scanner::FindAll(mod, pat, 8);
+        Log("[native] patron '%s' -> %zu coincidencias", pat, hits.size());
         for (uintptr_t at : hits) {
             uintptr_t start = FunctionStart(at);
             if (!start || !scanner::InExecutableSection(start)) continue;
@@ -401,15 +399,18 @@ bool Resolve() {
 
     Log("[native] %zu funciones candidatas a invocador", starts.size());
     for (uintptr_t start : starts) {
+        Log("[native] probando invocador %p", reinterpret_cast<void*>(start));
+        Sleep(40);
         g_mode = MODE_INVOKER;
         g_invoker = reinterpret_cast<Invoker>(start);
-        if (DetectAbi("invocador")) {
-            Log("[native] invocador en %p", reinterpret_cast<void*>(start));
+        if (DetectAbi("invocador", 3)) {
+            Log("[native] invocador aceptado en %p", reinterpret_cast<void*>(start));
             return true;
         }
+        Log("[native] descartado %p", reinterpret_cast<void*>(start));
     }
 
-    // 2) tabla, por si el invocador no se localiza.
+    // Respaldo por tabla, solo con los mismos patrones especificos.
     g_invoker = nullptr;
     g_mode = MODE_TABLE;
 
@@ -417,15 +418,14 @@ bool Resolve() {
     int   bestScore = 0;
     int   bestHash = g_hashOff, bestHandler = g_handlerOff;
 
-    for (const Pat& pat : pats) {
-        auto hits = scanner::FindAll(mod, pat.text, 128);
+    for (const char* pat : kSpecific) {
+        auto hits = scanner::FindAll(mod, pat, 8);
         for (uintptr_t at : hits) {
             const int32_t rel = *reinterpret_cast<int32_t*>(at + 3);
             auto* slot = reinterpret_cast<Reg***>(at + 7 + rel);
-            uintptr_t raw = reinterpret_cast<uintptr_t>(slot);
+            const uintptr_t raw = reinterpret_cast<uintptr_t>(slot);
             if (raw < 0x10000) continue;
 
-            // directo y desreferenciado, con las dos distribuciones de nodo
             for (int pass = 0; pass < 2; ++pass) {
                 Reg** candidate = pass ? reinterpret_cast<Reg**>(Read64(raw))
                                        : reinterpret_cast<Reg**>(raw);
@@ -450,7 +450,7 @@ bool Resolve() {
     g_handlerOff = bestHandler;
     Log("[native] tabla en %p (puntuacion %d/%zu)", static_cast<void*>(g_table),
         bestScore, sizeof(kProbes) / sizeof(kProbes[0]));
-    return DetectAbi("tabla");
+    return DetectAbi("tabla", 6);
 }
 } // namespace
 
@@ -481,24 +481,7 @@ bool init() {
         return false;
     }
 
-    g_hasScreen = false;
-    int me = -1;
-    __try {
-        me = static_cast<int>(Call(N_PLAYER_ID));
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        me = -1;
-    }
-
-    if (me >= 0) {
-        uint64_t h = 0;
-        __try {
-            h = Call(N_SCREEN, 0.0f, 0.0f, 0.0f, &me, &me);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            h = 0;
-        }
-        g_hasScreen = Get(N_SCREEN) != nullptr;
-    }
-
+    g_hasScreen = (g_mode == MODE_TABLE) ? (Get(N_SCREEN) != nullptr) : false;
     g_nativeOk = true;
     Log("[native] listo (modo %s, pantalla %s)", g_mode == MODE_INVOKER ? "invocador" : "tabla",
         g_hasScreen ? "native" : "matriz");
@@ -513,6 +496,7 @@ void shutdown() {
 
 void tick() {
     if (!ready()) return;
+    ++g_ticks;
 
     const int me = static_cast<int>(Call(N_PLAYER_ID));
     if (me < 0 || me > 32) return;
@@ -557,9 +541,28 @@ void tick() {
     Call(N_CAM_PITCH, pitch, 1.0f);
 }
 
+const char* NameOf(int i, int ped, ULONGLONG now) {
+    NameCache& c = g_names[i & 31];
+    const bool stale = c.ped != ped || (now - c.at) > 2000;
+    if (!stale && c.name[0]) return c.name;
+
+    c.ped = ped;
+    c.at = now;
+    c.name[0] = '\0';
+
+    const char* raw = reinterpret_cast<const char*>(Call(N_NAME, i));
+    if (raw && Readable(raw, 32)) {
+        memcpy(c.name, raw, 31);
+        c.name[31] = '\0';
+    }
+    return c.name;
+}
+
 void render() {
     if (!ready() || (!g_esp && !g_box)) return;
     if (!ImGui::GetCurrentContext()) return;
+    // El ESP a medio ritmo: la mitad de llamadas por frame.
+    if (g_ticks & 1) return;
 
     const int me = static_cast<int>(Call(N_PLAYER_ID));
     const int selfPed = static_cast<int>(Call(N_PLAYER_PED_ID));
@@ -568,6 +571,8 @@ void render() {
 
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
     if (!dl) return;
+
+    const ULONGLONG now = GetTickCount64();
 
     for (int i = 0; i < 32; ++i) {
         if (i == me || !Call(N_ACTIVE, i)) continue;
@@ -597,17 +602,11 @@ void render() {
         }
 
         if (g_esp) {
-            const char* rawName = reinterpret_cast<const char*>(Call(N_NAME, i));
-            char name[48]{};
-            if (rawName && Readable(rawName, 32)) {
-                memcpy(name, rawName, 31);
-                name[31] = '\0';
-            }
-
+            const char* name = NameOf(i, ped, now);
             const int hp = static_cast<int>(Call(N_HEALTH, ped));
             char label[160]{};
             snprintf(label, sizeof(label), "%s\n%d hp\n%.0f m",
-                     name[0] ? name : "jugador", hp, dist);
+                     (name && name[0]) ? name : "jugador", hp, dist);
             dl->AddText(ImVec2(hx + boxW * 0.55f, hy), IM_COL32(0, 255, 128, 255), label);
         }
     }
