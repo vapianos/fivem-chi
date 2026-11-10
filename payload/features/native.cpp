@@ -16,10 +16,13 @@ namespace {
 
 using Handler = void(*)(void*);
 
+// Nodo de la tabla de registro. El orden real es { next, handler, hash }: el
+// hash va al final. No se usa como struct, solo para tipar el array de cubos,
+// porque los nodos se leen por offset (ver g_hashOff / g_handlerOff).
 struct Reg {
     Reg*     next;
-    uint64_t hash;
     Handler  handler;
+    uint64_t hash;
 };
 
 #pragma pack(push, 1)
@@ -44,6 +47,8 @@ struct alignas(16) Ctx {
 Reg**     g_table = nullptr;
 uintptr_t g_game  = 0;
 size_t    g_size  = 0;
+int       g_hashOff    = 16;   // offset de hash dentro del nodo
+int       g_handlerOff = 8;    // offset de handler dentro del nodo
 bool      g_hasScreen = false;
 int       g_screenFails = 0;
 
@@ -69,6 +74,12 @@ constexpr uint64_t N_CAM_COORD      = 0x14D6F5678D8F1B37;
 constexpr uint64_t N_CAM_ROT        = 0x837765A25378F0BB;
 constexpr uint64_t N_CAM_FOV        = 0x65019750A0324133;
 
+uint64_t Read64(uintptr_t at) {
+    uint64_t v = 0;
+    memcpy(&v, reinterpret_cast<const void*>(at), sizeof(v));
+    return v;
+}
+
 void Begin(Ctx& c) { c = {}; c.args = c.slots; c.ret = c.rets; }
 
 void Push(Ctx& c, int v)    { c.args[c.argCount++] = (void*)(intptr_t)v; }
@@ -89,8 +100,12 @@ float AsFloat(uint64_t raw) {
 
 Handler Get(uint64_t hash) {
     if (!g_table) return nullptr;
-    for (Reg* r = g_table[hash & 0xFF]; r; r = r->next)
-        if (r->hash == hash) return r->handler;
+    uintptr_t node = reinterpret_cast<uintptr_t>(g_table[hash & 0xFF]);
+    for (int guard = 0; node && guard < 64; ++guard) {
+        if (Read64(node + g_hashOff) == hash)
+            return reinterpret_cast<Handler>(Read64(node + g_handlerOff));
+        node = Read64(node);
+    }
     return nullptr;
 }
 
@@ -210,9 +225,9 @@ constexpr uint64_t kProbes[] = {
     N_INVINCIBLE, N_SUPERJUMP, N_NAME, N_CAM_COORD,
 };
 
-// Puntua cuantos hashes conocidos aparecen con handler ejecutable. Exigir los
-// tres primeros y descartar el resto rechaza las 8 coincidencias de 3889.
-int ScoreTable(Reg** t) {
+// Puntua cuantos hashes conocidos aparecen, con handler ejecutable, leyendo el
+// nodo con los offsets dados. Se prueban las dos distribuciones posibles.
+int ScoreTable(Reg** t, int hashOff, int handlerOff) {
     if (reinterpret_cast<uintptr_t>(t) < 0x10000) return 0;
 
     MEMORY_BASIC_INFORMATION mbi{};
@@ -223,11 +238,14 @@ int ScoreTable(Reg** t) {
     int score = 0;
     __try {
         for (uint64_t probe : kProbes) {
-            Reg* r = t[probe & 0xFF];
-            for (int g = 0; r && g < 32; ++g, r = r->next) {
-                if (r->hash != probe) continue;
-                if (scanner::InExecutableSection(reinterpret_cast<uintptr_t>(r->handler))) ++score;
-                break;
+            uintptr_t node = reinterpret_cast<uintptr_t>(t[probe & 0xFF]);
+            for (int guard = 0; node && guard < 64; ++guard) {
+                if (Read64(node + hashOff) == probe) {
+                    if (scanner::InExecutableSection(static_cast<uintptr_t>(Read64(node + handlerOff))))
+                        ++score;
+                    break;
+                }
+                node = Read64(node);
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -268,9 +286,10 @@ bool Resolve() {
 
     Reg** best = nullptr;
     int   bestScore = 0;
+    int   bestHash = g_hashOff, bestHandler = g_handlerOff;
 
     for (const Pat& pat : pats) {
-        auto hits = scanner::FindAll(mod, pat.text, 64);
+        auto hits = scanner::FindAll(mod, pat.text, 128);
         Log("[native] patron '%s' -> %zu coincidencias", pat.text, hits.size());
 
         for (uintptr_t at : hits) {
@@ -280,8 +299,13 @@ bool Resolve() {
                                            : reinterpret_cast<Reg**>(slot);
             if (reinterpret_cast<uintptr_t>(candidate) < 0x10000) continue;
 
-            const int score = ScoreTable(candidate);
-            if (score > bestScore) { bestScore = score; best = candidate; }
+            // Distribucion A: { next, handler, hash }
+            const int sA = ScoreTable(candidate, 16, 8);
+            if (sA > bestScore) { bestScore = sA; best = candidate; bestHash = 16; bestHandler = 8; }
+
+            // Distribucion B: { next, hash, handler }
+            const int sB = ScoreTable(candidate, 8, 16);
+            if (sB > bestScore) { bestScore = sB; best = candidate; bestHash = 8; bestHandler = 16; }
         }
     }
 
@@ -290,9 +314,12 @@ bool Resolve() {
         return false;
     }
 
-    g_table = best;
-    Log("[native] tabla validada en %p (puntuacion %d/%zu)", static_cast<void*>(g_table),
-        bestScore, sizeof(kProbes) / sizeof(kProbes[0]));
+    g_table      = best;
+    g_hashOff    = bestHash;
+    g_handlerOff = bestHandler;
+    Log("[native] tabla validada en %p (puntuacion %d/%zu, hash+0x%X handler+0x%X)",
+        static_cast<void*>(g_table), bestScore, sizeof(kProbes) / sizeof(kProbes[0]),
+        g_hashOff, g_handlerOff);
     return true;
 }
 } // namespace
