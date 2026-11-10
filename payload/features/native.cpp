@@ -33,7 +33,7 @@ struct alignas(16) Ctx {
 
 enum Mode { MODE_TABLE, MODE_INVOKER };
 
-Mode      g_mode  = MODE_INVOKER;
+Mode      g_mode  = MODE_TABLE;
 void**    g_table = nullptr;
 Invoker   g_invoker = nullptr;
 int       g_hashOff    = 16;
@@ -47,7 +47,6 @@ unsigned  g_ticks = 0;
 std::atomic<bool>  g_esp{ true }, g_box{ true }, g_aim{ false }, g_god{ false }, g_jump{ false };
 std::atomic<bool>  g_skel{ true }, g_aimHold{ false };
 std::atomic<bool>  g_scanStarted{ false };
-std::atomic<bool>  g_scanDone{ false };
 std::atomic<float> g_fov{ 90.0f };
 std::atomic<float> g_smooth{ 0.55f };
 
@@ -101,6 +100,9 @@ static const BoneLink kLinks[] = {
 
 const char* g_status = "sin iniciar";
 
+char g_probeA[] = "abc";
+char g_probeB[] = "venice";
+
 uint64_t Read64(uintptr_t at) {
     uint64_t v = 0;
     memcpy(&v, reinterpret_cast<const void*>(at), sizeof(v));
@@ -115,6 +117,10 @@ bool Readable(const void* p, size_t len) {
     if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
     return reinterpret_cast<uintptr_t>(p) + len <=
            reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+}
+
+bool PlausiblePtr(uint64_t v) {
+    return v > 0x10000 && v < 0x0000800000000000ULL;
 }
 
 // joaat identico al del juego: GET_HASH_KEY lo aplica tras pasar a minusculas.
@@ -153,12 +159,12 @@ void PushRaw(Ctx& c, void* v) {
     memcpy(c.raw + g_abi.argCount, &n, 4);
 }
 
-void Push(Ctx& c, int v)          { PushRaw(c, (void*)(intptr_t)v); }
-void Push(Ctx& c, bool v)         { PushRaw(c, (void*)(intptr_t)(v ? 1 : 0)); }
-void Push(Ctx& c, float v)        { uint32_t b; memcpy(&b, &v, 4); PushRaw(c, (void*)(uintptr_t)b); }
-void Push(Ctx& c, void* p)        { PushRaw(c, p); }
-void Push(Ctx& c, float* p)       { PushRaw(c, p); }
-void Push(Ctx& c, const char* p)  { PushRaw(c, (void*)p); }
+void Push(Ctx& c, int v)         { PushRaw(c, (void*)(intptr_t)v); }
+void Push(Ctx& c, bool v)        { PushRaw(c, (void*)(intptr_t)(v ? 1 : 0)); }
+void Push(Ctx& c, float v)       { uint32_t b; memcpy(&b, &v, 4); PushRaw(c, (void*)(uintptr_t)b); }
+void Push(Ctx& c, void* p)       { PushRaw(c, p); }
+void Push(Ctx& c, float* p)      { PushRaw(c, p); }
+void Push(Ctx& c, const char* p) { PushRaw(c, (void*)p); }
 void Push(Ctx& c, Vec3* v) {
     PushRaw(c, v);
     uint32_t d = 0;
@@ -205,7 +211,7 @@ Handler Get(uint64_t hash) {
     if (slot.h && slot.hash == hash) return slot.h;
 
     uintptr_t node = reinterpret_cast<uintptr_t>(g_table[hash & 0xFF]);
-    for (int guard = 0; node && guard < 64; ++guard) {
+    for (int guard = 0; node && guard < 96; ++guard) {
         if (Read64(node + g_hashOff) == hash) {
             Handler h = reinterpret_cast<Handler>(Read64(node + g_handlerOff));
             if (!scanner::InExecutableSection(reinterpret_cast<uintptr_t>(h))) return nullptr;
@@ -349,47 +355,7 @@ bool W2S(const Vec3& w, float& sx, float& sy) {
     return W2SMatrix(w, sx, sy);
 }
 
-constexpr uint64_t kProbes[] = {
-    N_PLAYER_PED_ID, N_PLAYER_ID, N_COORDS, N_HEALTH,
-    N_INVINCIBLE, N_SUPERJUMP, N_NAME, N_CAM_COORD, N_HASH_KEY,
-};
-
-bool ProbeTable(void** t, int& hashOff, int& handlerOff) {
-    if (reinterpret_cast<uintptr_t>(t) < 0x10000) return false;
-    if (!Readable(t, 256 * sizeof(void*))) return false;
-
-    static const int pairs[2][2] = { { 8, 16 }, { 16, 8 } };
-    int best = 0, bh = 0, bhd = 0;
-
-    for (auto& pr : pairs) {
-        int matched = 0;
-        for (int i = 0; i < 256; ++i) {
-            uintptr_t n = reinterpret_cast<uintptr_t>(t[i]);
-            for (int g = 0; n && g < 6; ++g) {
-                if (!Readable(reinterpret_cast<void*>(n), 24)) break;
-                for (uint64_t probe : kProbes)
-                    if (Read64(n + pr[0]) == probe) ++matched;
-                n = Read64(n);
-            }
-        }
-        if (matched > best) { best = matched; bh = pr[0]; bhd = pr[1]; }
-    }
-
-    if (best < 2) return false;
-    hashOff = bh;
-    handlerOff = bhd;
-    return true;
-}
-
-const Abi kAbis[] = {
-    { 0x00, 0x08, 0x0C, 0x10, 0x18 },
-    { 0x00, 0x08, 0x0C, 0x18, 0x10 },
-    { 0x08, 0x10, 0x14, 0x18, 0x20 },
-    { 0x08, 0x10, 0x14, 0x20, 0x18 },
-    { 0x00, 0x10, 0x14, 0x18, 0x20 },
-};
-
-// ---------------------------------------------------------------- candidatos
+// ------------------------------------------------------------------ candidatos
 
 struct Candidate {
     Mode  mode;
@@ -403,44 +369,48 @@ int ModuleScore(const std::string& name) {
     std::string l = name;
     std::transform(l.begin(), l.end(), l.begin(), [](unsigned char c) { return (char)::tolower(c); });
     if (l.find("citizen-scripting-core") != std::string::npos) return 0;
-    if (l.find("gta-core-five") != std::string::npos)        return 1;
+    if (l.find("gta-core-five") != std::string::npos)         return 1;
     if (l.find("citizen-scripting-lua") != std::string::npos) return 2;
-    if (l.find("citizen") != std::string::npos)              return 3;
-    if (l.find("lua") != std::string::npos)                  return 4;
-    if (l.find("gta5") != std::string::npos)                 return 5;
-    if (l.find("gtaprocess") != std::string::npos)           return 6;
-    if (l.find("fivem") != std::string::npos)                return 7;
-    return 20;
+    if (l.find("citizen") != std::string::npos)               return 3;
+    if (l.find("scripting") != std::string::npos)             return 4;
+    if (l.find("fivem") != std::string::npos)                 return 5;
+    if (l.find("gtaprocess") != std::string::npos)            return 6;
+    if (l.find("gta5") != std::string::npos)                  return 7;
+    return 30;
 }
+
+std::vector<ModuleInfo> ScoredModules(int maxScore) {
+    auto mods = modules::All();
+    std::stable_sort(mods.begin(), mods.end(), [](const ModuleInfo& a, const ModuleInfo& b) {
+        return ModuleScore(a.name) < ModuleScore(b.name);
+    });
+    std::vector<ModuleInfo> out;
+    for (auto& m : mods) {
+        if (ModuleScore(m.name) > maxScore) continue;
+        if (m.size < 0x10000) continue;
+        out.push_back(m);
+    }
+    return out;
+}
+
+// ---- 1) invocador por patron (rapido, como pista secundaria) ----------------
 
 void AddInvoker(uintptr_t fn) {
     if (!fn || !scanner::InExecutableSection(fn)) return;
     for (auto& c : g_cands)
         if (c.mode == MODE_INVOKER && c.target == reinterpret_cast<void*>(fn)) return;
-    if (g_cands.size() >= 16) return;
+    if (g_cands.size() >= 24) return;
     g_cands.push_back({ MODE_INVOKER, reinterpret_cast<void*>(fn), 0, 0 });
 }
 
-// El envoltorio hace: lea rcx,[ctx] ; mov rdx,rdi ; call <invocador>. Sirve el
-// DESTINO del call, no el envoltorio. Se barre TODOS los modulos porque
-// NativeContext::Invoke no vive necesariamente en un modulo de nombre conocido.
 void CollectInvokers() {
     static const char* kPats[] = {
         "48 8D 0D ? ? ? ? 48 8B D7 E8 ? ? ? ? 48 8B CF",
         "48 8D 0D ? ? ? ? 48 8B D7 E8",
-        "48 8B D7 E8 ? ? ? ? 48 8B CF",
     };
 
-    auto mods = modules::All();
-    std::stable_sort(mods.begin(), mods.end(), [](const ModuleInfo& a, const ModuleInfo& b) {
-        return ModuleScore(a.name) < ModuleScore(b.name);
-    });
-
-    for (auto& m : mods) {
-        if (m.size < 0x10000) continue;
-        if (g_cands.size() >= 16) break;
-
-        size_t before = g_cands.size();
+    for (auto& m : ScoredModules(4)) {
+        if (g_cands.size() >= 12) break;
         for (const char* pat : kPats) {
             for (uintptr_t at : scanner::FindAll(m, pat, 2)) {
                 const size_t e8 = (pat[3] == '?') ? 10 : 3;
@@ -448,70 +418,109 @@ void CollectInvokers() {
                 const int32_t rel = *reinterpret_cast<int32_t*>(at + e8 + 1);
                 AddInvoker(at + e8 + 5 + rel);
             }
-            if (g_cands.size() >= 16) break;
         }
-        if (g_cands.size() != before)
-            Log("[native] %zu invocador(es) en %s", g_cands.size() - before, m.name.c_str());
     }
+    Log("[native] invocadores por patron: %zu", g_cands.size());
+}
+
+// ---- 2) tabla por estructura (sin patrones, funciona en cualquier build) ----
+//
+// La tabla real es void*[256] de punteros a nodos { next, handler, hash }. Se
+// reconoce porque todas las entradas apuntan a memoria valida, el handler cae
+// en seccion ejecutable y el otro campo es un hash de 64 bits (los punteros no
+// pasan de 2^47, los hashes si).
+
+bool AnalyzeTable(uintptr_t at, int& hashOff, int& handlerOff) {
+    auto* t = reinterpret_cast<uint64_t*>(at);
+
+    // prefiltro barato: cuatro entradas seguidas que parezcan punteros
+    for (int i = 0; i < 4; ++i)
+        if (!PlausiblePtr(t[i])) return false;
+
+    int nonNull = 0;
+    for (int i = 0; i < 256; i += 2) {
+        const uint64_t n = t[i];
+        if (!n) continue;
+        if (!Readable(reinterpret_cast<void*>(n), 24)) return false;
+        ++nonNull;
+    }
+    if (nonNull < 100) return false;   // de 128 muestras
+
+    int hOff = 0, hdOff = 0, hits = 0;
+    for (int i = 0; i < 256; i += 4) {
+        uintptr_t n = static_cast<uintptr_t>(t[i]);
+        for (int g = 0; g < 3 && n; ++g) {
+            if (!Readable(reinterpret_cast<void*>(n), 24)) break;
+
+            const uint64_t next = Read64(n);
+            const uint64_t a = Read64(n + 8);
+            const uint64_t b = Read64(n + 16);
+
+            const bool execA = scanner::InExecutableSection(static_cast<uintptr_t>(a));
+            const bool execB = scanner::InExecutableSection(static_cast<uintptr_t>(b));
+            if (!execA && !execB) break;
+
+            const uint64_t hash = execA ? b : a;
+            if (hash < 0x0001000000000000ULL) break;
+
+            ++hits;
+            hOff  = execA ? 16 : 8;
+            hdOff = execA ? 8 : 16;
+            n = static_cast<uintptr_t>(next);
+        }
+    }
+    if (hits < 60) return false;
+
+    hashOff = hOff;
+    handlerOff = hdOff;
+    return true;
 }
 
 void CollectTables() {
-    ModuleInfo game = modules::Game();
-    if (!game.valid()) return;
+    int found = 0;
+    for (auto& m : ScoredModules(7)) {
+        uintptr_t cursor = m.base;
+        const uintptr_t end = m.base + m.size;
 
-    static const char* kPats[] = {
-        "48 8B 0D ? ? ? ? 48 8B D7 E8",
-        "48 8D 0D ? ? ? ? 48 8B D7 E8",
-    };
+        while (cursor < end && found < 24) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi))) break;
 
-    for (const char* pat : kPats) {
-        for (uintptr_t at : scanner::FindAll(game, pat, 8)) {
-            const int32_t rel = *reinterpret_cast<int32_t*>(at + 3);
-            const uintptr_t raw = at + 7 + rel;
-            if (raw < 0x10000) continue;
-            for (int pass = 0; pass < 2; ++pass) {
-                void** cand = pass ? reinterpret_cast<void**>(Read64(raw))
-                                   : reinterpret_cast<void**>(raw);
-                int h = 0, hd = 0;
-                if (!ProbeTable(cand, h, hd)) continue;
-                if (g_cands.size() >= 24) return;
-                g_cands.push_back({ MODE_TABLE, cand, h, hd });
-                break;
+            const uintptr_t rb = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+            uintptr_t re = rb + mbi.RegionSize;
+            if (re > end) re = end;
+
+            const DWORD p = mbi.Protect;
+            const bool data = mbi.State == MEM_COMMIT && !(p & (PAGE_GUARD | PAGE_NOACCESS)) &&
+                              !(p & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) &&
+                              (p & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_READONLY));
+
+            if (data && re > cursor + 256 * 8) {
+                for (uintptr_t at = (cursor + 7) & ~(uintptr_t)7; at + 256 * 8 <= re; at += 8) {
+                    int h = 0, hd = 0;
+                    if (!AnalyzeTable(at, h, hd)) continue;
+                    g_cands.push_back({ MODE_TABLE, reinterpret_cast<void*>(at), h, hd });
+                    Log("[native] tabla estructural en %s+0x%llX (hash+0x%X handler+0x%X)",
+                        m.name.c_str(), (unsigned long long)(at - m.base), h, hd);
+                    if (++found >= 24) break;
+                }
             }
+            cursor = re ? re : cursor + 0x1000;
         }
+        if (found) break;
     }
+    Log("[native] tablas estructurales: %d", found);
 }
 
-void DoScan() {
-    CollectInvokers();
-    Log("[native] invocadores: %zu", g_cands.size());
-    const size_t before = g_cands.size();
-    CollectTables();
-    Log("[native] tablas: %zu, candidatos: %zu", g_cands.size() - before, g_cands.size());
-}
+// -------------------------------------------------------------- comprobacion
 
-DWORD WINAPI ScanThread(LPVOID) {
-    __try {
-        DoScan();
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        LogE("[native] excepcion durante el escaneo");
-    }
-    g_scanDone = true;
-    return 0;
-}
-
-// ------------------------------------------------------------------ validacion
-
-enum PState { PS_IDLE, PS_TRY };
-PState    g_pstate = PS_IDLE;
-size_t    g_candIdx = 0;
-int       g_stage = 0;
-int       g_streak = 0;
-int       g_me = -1, g_ped = 0;
-ULONGLONG g_retryAt = 0;
-
-char g_probeA[] = "abc";
-char g_probeB[] = "venice";
+const Abi kAbis[] = {
+    { 0x00, 0x08, 0x0C, 0x10, 0x18 },
+    { 0x00, 0x08, 0x0C, 0x18, 0x10 },
+    { 0x08, 0x10, 0x14, 0x18, 0x20 },
+    { 0x08, 0x10, 0x14, 0x20, 0x18 },
+    { 0x00, 0x10, 0x14, 0x18, 0x20 },
+};
 
 void Apply(const Candidate& c) {
     g_mode = c.mode;
@@ -524,92 +533,66 @@ void Apply(const Candidate& c) {
 
 void Accept(const Candidate& c) {
     g_nativeOk = true;
-    g_pstate = PS_IDLE;
     g_hasScreen = (g_mode == MODE_TABLE) ? (Get(N_SCREEN) != nullptr) : false;
     g_screenFails = 0;
-    g_status = (g_mode == MODE_INVOKER) ? "validado (invocador)" : "validado (tabla)";
+    g_status = (g_mode == MODE_INVOKER) ? "listo (invocador)" : "listo (tabla)";
     Log("[native] VALIDADO con %s en %p", g_mode == MODE_INVOKER ? "invocador" : "tabla", c.target);
 }
 
-bool Reject(const char* why) {
-    Log("[native] candidato %zu descartado: %s", g_candIdx, why);
-    ++g_candIdx;
-    g_pstate = PS_IDLE;
-    g_stage = 0;
-    g_streak = 0;
-    return false;
-}
-
-// Un paso por frame. La prueba fuerte es GET_HASH_KEY contra joaat calculado
-// aqui: valida binding, ABI, orden de argumentos y paso de strings sin
-// depender de estar en partida.
-bool Step() {
-    switch (g_stage) {
-    case 0: {
-        const uint32_t want = Joaat(g_probeA);
-        uint32_t got = 0;
-        __try { got = static_cast<uint32_t>(Call(N_HASH_KEY, g_probeA)); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return Reject("HASH_KEY lanzo"); }
-        if (got != want) return Reject("HASH_KEY no coincide");
-        ++g_stage;
-        return true;
-    }
-    case 1: {
-        const uint32_t want = Joaat(g_probeB);
-        uint32_t got = 0;
-        __try { got = static_cast<uint32_t>(Call(N_HASH_KEY, g_probeB)); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return Reject("segundo HASH_KEY lanzo"); }
-        if (got != want) return Reject("segundo HASH_KEY no coincide");
-        ++g_stage;
-        return true;
-    }
-    case 2: {
-        // Ya esta probado el binding; esto solo afina datos de partida.
-        __try {
-            g_me = static_cast<int>(Call(N_PLAYER_ID));
-            g_ped = static_cast<int>(Call(N_PLAYER_PED_ID));
-        } __except (EXCEPTION_EXECUTE_HANDLER) { g_me = -1; g_ped = 0; }
-        ++g_stage;
-        return true;
-    }
-    default: {
-        if (++g_streak >= 2) { Accept(g_cands[g_candIdx]); return true; }
-        return true;
-    }
-    }
-}
-
-void Pump() {
-    if (g_nativeOk || !g_scanDone) return;
-
-    const ULONGLONG now = GetTickCount64();
-    if (now < g_retryAt) return;
-
-    if (g_cands.empty()) {
-        g_status = "sin candidatos";
-        g_retryAt = now + 2000;
-        return;
-    }
-
-    if (g_pstate == PS_IDLE) {
-        if (g_candIdx >= g_cands.size()) {
-            g_candIdx = 0;
-            g_status = "sin candidato valido, reintentando";
-            g_retryAt = now + 3000;
-            return;
-        }
-        Apply(g_cands[g_candIdx]);
-        g_stage = 0;
-        g_streak = 0;
-        g_pstate = PS_TRY;
-        return;
-    }
+// GET_HASH_KEY("abc") tiene que devolver exactamente joaat("abc"). Esto prueba
+// binding, ABI, orden de argumentos y paso de strings de una sola vez.
+bool Confirm(const Candidate& c) {
+    Apply(c);
 
     for (const Abi& a : kAbis) {
         g_abi = a;
-        if (Step()) return;
-        if (g_pstate == PS_IDLE) return;
+
+        uint32_t got = 0;
+        __try { got = static_cast<uint32_t>(Call(N_HASH_KEY, g_probeA)); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+        if (got != Joaat(g_probeA)) continue;
+
+        uint32_t got2 = 0;
+        __try { got2 = static_cast<uint32_t>(Call(N_HASH_KEY, g_probeB)); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+        if (got2 != Joaat(g_probeB)) continue;
+
+        Accept(c);
+        return true;
     }
+    return false;
+}
+
+void TryResolve() {
+    CollectInvokers();
+    for (auto& c : g_cands)
+        if (Confirm(c)) return;
+
+    const size_t before = g_cands.size();
+    g_cands.clear();
+    CollectTables();
+    for (size_t i = 0; i < g_cands.size(); ++i) {
+        if (Confirm(g_cands[i])) return;
+        if (g_nativeOk) return;
+    }
+    Log("[native] sin resolucion (invocadores: %zu, tablas: %zu)", before, g_cands.size());
+}
+
+DWORD WINAPI ScanThread(LPVOID) {
+    for (int attempt = 0; attempt < 30; ++attempt) {
+        if (g_nativeOk) return 0;
+
+        __try {
+            TryResolve();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            LogE("[native] excepcion durante el escaneo");
+        }
+
+        if (g_nativeOk) return 0;
+        g_status = "sin candidato valido, reintentando";
+        Sleep(2000);
+    }
+    return 0;
 }
 } // namespace
 
@@ -641,9 +624,6 @@ void setSmooth(float v) { g_smooth = v; }
 
 void rearm() {
     if (g_nativeOk) return;
-    g_candIdx = 0;
-    g_pstate = PS_IDLE;
-    g_retryAt = 0;
     g_status = "rearme manual";
     Log("rearme de resolucion solicitado");
 }
@@ -665,7 +645,6 @@ void shutdown() {
 }
 
 void tick() {
-    Pump();
     if (!ready()) return;
     ++g_ticks;
 
