@@ -57,20 +57,36 @@ bool GetCoords(int64_t ent, Vec3& out) {
 }
 
 bool W2S(const Vec3& p, float sw, float sh, float& sx, float& sy) {
-    alignas(16) uint8_t ret[64]{};
-    uint64_t args[3] = { 0, 0, 0 };
-    float xyz[3] = { p.x, p.y, p.z };
-    memcpy(&args[0], &xyz[0], 4);
-    memcpy(&args[1], &xyz[1], 4);
-    memcpy(&args[2], &xyz[2], 4);
-    if (!natives::call(0x34E82F05DF2974F5, ret, 3, args)) return false;
-    const bool on = *reinterpret_cast<uint8_t*>(ret) != 0;
-    const float ox = *reinterpret_cast<float*>(ret + 8);
-    const float oy = *reinterpret_cast<float*>(ret + 16);
-    if (!on) return false;
+    // GET_SCREEN_COORD_FROM_WORLD_COORD(x, y, z, &sx, &sy) -> BOOL
+    alignas(16) uint8_t ret[16]{};
+    float ox = 0.0f, oy = 0.0f;
+    uint64_t args[5] = { 0, 0, 0, 0, 0 };
+    memcpy(&args[0], &p.x, 4);
+    memcpy(&args[1], &p.y, 4);
+    memcpy(&args[2], &p.z, 4);
+    args[3] = reinterpret_cast<uint64_t>(&ox);
+    args[4] = reinterpret_cast<uint64_t>(&oy);
+
+    if (!natives::call(0x34E82F05DF2974F5, ret, 5, args)) return false;
+    if (!*reinterpret_cast<uint8_t*>(ret)) return false;
+    // Fuera de este rango es proyeccion detras de la camara o basura.
+    if (!(ox > -0.5f && ox < 1.5f) || !(oy > -0.5f && oy < 1.5f)) return false;
+
     sx = ox * sw;
     sy = oy * sh;
     return true;
+}
+
+void ScreenRes(float& sw, float& sh) {
+    sw = 1920.0f;
+    sh = 1080.0f;
+    if (!natives::has(0x2E397A4B1C4B6F4F)) return;
+
+    alignas(16) uint8_t ret[16]{};
+    int x = 0, y = 0;
+    uint64_t args[2] = { reinterpret_cast<uint64_t>(&x), reinterpret_cast<uint64_t>(&y) };
+    if (!natives::call(0x2E397A4B1C4B6F4F, ret, 2, args)) return;
+    if (x > 0 && y > 0) { sw = static_cast<float>(x); sh = static_cast<float>(y); }
 }
 
 bool BoneCoords(int64_t ped, int bone, Vec3& out) {
@@ -324,15 +340,8 @@ void tick() {
     if (g_god)  DoGod();
     if (g_jump) DoJump();
 
-    float sw = 1920.0f, sh = 1080.0f;
-    if (natives::has(0x2E397A4B1C4B6F4F)) {
-        alignas(16) uint8_t res[64]{};
-        if (natives::call(0x2E397A4B1C4B6F4F, res, 0, nullptr)) {
-            const int w = *reinterpret_cast<int*>(res);
-            const int h = *reinterpret_cast<int*>(res + 8);
-            if (w > 0 && h > 0) { sw = static_cast<float>(w); sh = static_cast<float>(h); }
-        }
-    }
+    float sw, sh;
+    ScreenRes(sw, sh);
 
     BuildEsp(self, sw, sh);
 
