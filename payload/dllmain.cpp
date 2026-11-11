@@ -99,10 +99,15 @@ static void LogFrame(const char* prefix, uintptr_t addr) {
 // Primera pasada: se apunta el fallo ANTES de que FiveM lo intercepte. Se
 // devuelve CONTINUE_SEARCH para no alterar el manejo normal.
 static LONG CALLBACK VehFilter(EXCEPTION_POINTERS* ep) {
+    const auto* rec = ep->ExceptionRecord;
+
+    // 0x40010006 = DBG_PRINTEXCEPTION_C: es OutputDebugStringA, no un fallo.
+    // Sin esto el VEH se dispara con cada linea de log y tapa lo que importa.
+    if (rec->ExceptionCode == 0x40010006) return EXCEPTION_CONTINUE_SEARCH;
+
     const LONG n = InterlockedIncrement(&g_vehCount);
     if (n > 20) return EXCEPTION_CONTINUE_SEARCH;
 
-    const auto* rec = ep->ExceptionRecord;
     BootMark("VEH");
     LogE("=== VEH 0x%08X (fallo %ld)", rec->ExceptionCode, n);
     LogFrame("  rip", reinterpret_cast<uintptr_t>(rec->ExceptionAddress));

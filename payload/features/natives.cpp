@@ -42,9 +42,12 @@ struct NativeContext {
     void*    vector    = nullptr;
 };
 
-std::unordered_map<uint64_t, void*> g_map;
+std::unordered_map<uint64_t, void*> g_map;   // cache / modo cosechado
 bool        g_ready  = false;
+bool        g_member = false;                // el resolver es miembro (this + hash)
 const char* g_status = "sin resolver";
+
+void* g_getHandler = nullptr;                // modo exportacion
 
 struct Range { uintptr_t lo, hi; };
 std::vector<Range> g_exec;
@@ -71,16 +74,122 @@ void BuildExec() {
     }
 }
 
-// En un bloque de registro el hash de la entrada k esta exactamente `entries`
-// posiciones antes de su handler, asi que por cada puntero a codigo se mira
-// `entries` atras. No hay que alinear bloques ni leer contadores.
-size_t Harvest(const ModuleInfo& m, size_t entries) {
+std::string Lower(std::string s) {
+    for (auto& c : s) c = (char)::tolower((unsigned char)c);
+    return s;
+}
+
+// ------------------------------------------------------------------ modo 1
+
+// Pregunta a la funcion de FiveM. Se prueban las dos convenciones: estatica
+// (hash) y miembro (this, hash). La que devuelva algo ejecutable es la buena.
+void* Ask(uint64_t hash) {
+    if (!g_getHandler) return nullptr;
+    void* h = nullptr;
+    __try {
+        if (g_member) {
+            auto fn = reinterpret_cast<void*(*)(void*, uint64_t)>(g_getHandler);
+            h = fn(nullptr, hash);
+        } else {
+            auto fn = reinterpret_cast<void*(*)(uint64_t)>(g_getHandler);
+            h = fn(hash);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+    return IsExec(reinterpret_cast<uintptr_t>(h)) ? h : nullptr;
+}
+
+bool ProbeConvention() {
+    __try {
+        auto one = reinterpret_cast<void*(*)(uint64_t)>(g_getHandler);
+        if (IsExec(reinterpret_cast<uintptr_t>(one(H_PLAYER_ID)))) { g_member = false; return true; }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    __try {
+        auto two = reinterpret_cast<void*(*)(void*, uint64_t)>(g_getHandler);
+        if (IsExec(reinterpret_cast<uintptr_t>(two(nullptr, H_PLAYER_ID)))) { g_member = true; return true; }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    return false;
+}
+
+// Recorre la tabla de exportaciones del modulo buscando el resolver.
+void* ScanExports(HMODULE h, const char* modName) {
+    auto* dos = reinterpret_cast<PIMAGE_DOS_HEADER>(h);
+    if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    auto* nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(reinterpret_cast<uint8_t*>(h) + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir.Size) return nullptr;
+
+    auto* exp  = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(reinterpret_cast<uint8_t*>(h) + dir.VirtualAddress);
+    auto* names = reinterpret_cast<DWORD*>(reinterpret_cast<uint8_t*>(h) + exp->AddressOfNames);
+    auto* ords  = reinterpret_cast<WORD*>(reinterpret_cast<uint8_t*>(h) + exp->AddressOfNameOrdinals);
+    auto* fns   = reinterpret_cast<DWORD*>(reinterpret_cast<uint8_t*>(h) + exp->AddressOfFunctions);
+
+    Log("[natives] %s: %lu exportaciones", modName, exp->NumberOfNames);
+
+    void* best = nullptr;
+    for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
+        const char* n = reinterpret_cast<const char*>(h) + names[i];
+        const std::string l = Lower(n);
+
+        if (l.find("nativehandler") == std::string::npos) continue;
+
+        const DWORD rva = fns[ords[i]];
+        if (rva >= dir.VirtualAddress && rva < dir.VirtualAddress + dir.Size) continue;  // forwarder
+
+        Log("[natives] candidato %s!%s", modName, n);
+
+        if (l.find("getnativehandler") != std::string::npos) {
+            best = reinterpret_cast<uint8_t*>(h) + rva;
+            break;
+        }
+        if (!best) best = reinterpret_cast<uint8_t*>(h) + rva;
+    }
+    return best;
+}
+
+bool ResolveViaExports() {
+    static const wchar_t* kMods[] = { L"gta-core-five.dll", L"scripting-gta.dll" };
+    for (const wchar_t* w : kMods) {
+        HMODULE h = GetModuleHandleW(w);
+        if (!h) { Log("[natives] %ls no cargado", w); continue; }
+
+        char name[64]{};
+        WideCharToMultiByte(CP_UTF8, 0, w, -1, name, sizeof(name) - 1, nullptr, nullptr);
+
+        g_getHandler = ScanExports(h, name);
+        if (!g_getHandler) continue;
+        Log("[natives] resolver en %p", g_getHandler);
+
+        if (ProbeConvention()) {
+            for (uint64_t v : kValidate)
+                if (!Ask(v)) { g_getHandler = nullptr; break; }
+            if (g_getHandler) {
+                g_status = g_member ? "resueltas (export, miembro)" : "resueltas (export)";
+                return true;
+            }
+        }
+        Log("[natives] el resolver de %s no respondio a los hashes conocidos", name);
+        g_getHandler = nullptr;
+    }
+    return false;
+}
+
+// ------------------------------------------------------------------ modo 2
+
+// Respaldo: cosecha de bloques con forma estricta (next, 7 hashes, 7 handlers,
+// contador 1..7). Menos falsos positivos que mirar solo punteros.
+size_t HarvestBlocks(const ModuleInfo& m) {
     auto* dos = reinterpret_cast<PIMAGE_DOS_HEADER>(m.base);
     if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
     auto* nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(m.base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
 
-    size_t pairs = 0;
+    size_t found = 0;
     auto* sec = IMAGE_FIRST_SECTION(nt);
     for (WORD s = 0; s < nt->FileHeader.NumberOfSections; ++s, ++sec) {
         if (sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) continue;
@@ -88,38 +197,44 @@ size_t Harvest(const ModuleInfo& m, size_t entries) {
 
         const uintptr_t lo  = m.base + sec->VirtualAddress;
         const uintptr_t end = lo + sec->Misc.VirtualSize;
-        uintptr_t cur = lo;
 
-        while (cur < end) {
-            MEMORY_BASIC_INFORMATION mbi{};
-            if (!VirtualQuery(reinterpret_cast<LPCVOID>(cur), &mbi, sizeof(mbi))) break;
+        for (uintptr_t at = lo; at + 0x80 <= end; at += 8) {
+            const auto* b = reinterpret_cast<const uint8_t*>(at);
 
-            uintptr_t rEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-            if (rEnd > end) rEnd = end;
+            uintptr_t next = 0;
+            memcpy(&next, b, 8);
+            if (next && (next < lo || next >= end)) continue;
 
-            const bool usable = mbi.State == MEM_COMMIT &&
-                                !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS));
+            uint32_t count = 0;
+            memcpy(&count, b + 0x78, 4);
+            if (count < 1 || count > 7) continue;
 
-            if (usable && rEnd > cur + entries * 8) {
-                const auto* p = reinterpret_cast<const uint64_t*>(cur);
-                const size_t n = (rEnd - cur) / 8;
-                for (size_t i = entries; i < n; ++i) {
-                    const uintptr_t fn = static_cast<uintptr_t>(p[i]);
-                    if (!IsExec(fn)) continue;
-                    const uint64_t h = p[i - entries];
-                    if (!h || IsExec(static_cast<uintptr_t>(h))) continue;
-                    g_map[h] = reinterpret_cast<void*>(fn);
-                    ++pairs;
-                }
-                Sleep(0);   // cede el hilo cada region
+            bool ok = true;
+            for (size_t k = 0; k < 7 && ok; ++k) {
+                uint64_t hash = 0; void* fn = nullptr;
+                memcpy(&hash, b + 0x08 + k * 8, 8);
+                memcpy(&fn, b + 0x40 + k * 8, 8);
+                if (!hash) { ok = false; break; }
+                if (IsExec(static_cast<uintptr_t>(hash))) { ok = false; break; }
+                if (!IsExec(reinterpret_cast<uintptr_t>(fn))) { ok = false; break; }
             }
-            cur = rEnd;
+            if (!ok) continue;
+
+            for (size_t k = 0; k < 7; ++k) {
+                uint64_t hash = 0; void* fn = nullptr;
+                memcpy(&hash, b + 0x08 + k * 8, 8);
+                memcpy(&fn, b + 0x40 + k * 8, 8);
+                g_map[hash] = fn;
+            }
+            ++found;
+            at += 0x78;
         }
     }
-    return pairs;
+    return found;
 }
 
 void* Lookup(uint64_t hash) {
+    if (g_getHandler) return Ask(hash);
     const auto it = g_map.find(hash);
     return it == g_map.end() ? nullptr : it->second;
 }
@@ -130,57 +245,35 @@ bool Validate() {
     return true;
 }
 
-std::vector<ModuleInfo> GameModules() {
-    std::vector<ModuleInfo> out;
-    for (auto& m : modules::All()) {
-        std::string l = m.name;
-        for (auto& c : l) c = (char)::tolower((unsigned char)c);
-        if (l.find("gtaprocess") != std::string::npos || l.find("gta5") != std::string::npos)
-            out.push_back(m);
+size_t TryHarvestBlocks(const ModuleInfo& m) {
+    __try {
+        return HarvestBlocks(m);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
     }
-    return out;
-}
-
-std::vector<ModuleInfo> FiveModules() {
-    std::vector<ModuleInfo> out;
-    for (auto& m : modules::All()) {
-        std::string l = m.name;
-        for (auto& c : l) c = (char)::tolower((unsigned char)c);
-        if (l.find("gta-core-five") != std::string::npos || l.find("scripting-gta") != std::string::npos)
-            out.push_back(m);
-    }
-    return out;
-}
-
-bool TryHarvest(const std::vector<ModuleInfo>& mods, size_t entries, size_t* total) {
-    *total = 0;
-    for (auto& m : mods) {
-        size_t n = 0;
-        __try { n = Harvest(m, entries); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { LogE("[natives] excepcion cosechando %s", m.name.c_str()); }
-        *total += n;
-        if (!n) continue;
-        Log("[natives] %s: %zu pares con paso %zu", m.name.c_str(), n, entries);
-        if (Validate()) {
-            Log("[natives] tabla cosechada de %s (paso %zu, %zu nativas)",
-                m.name.c_str(), entries, g_map.size());
-            g_status = "resueltas";
-            return true;
-        }
-    }
-    return false;
 }
 
 bool Resolve() {
     BuildExec();
     if (g_exec.empty()) { g_status = "sin rangos ejecutables"; return false; }
 
-    for (size_t entries : { size_t(7), size_t(8), size_t(6), size_t(9) }) {
-        g_map.clear();
-        size_t a = 0, b = 0;
-        if (TryHarvest(GameModules(), entries, &a)) return true;
-        if (TryHarvest(FiveModules(), entries, &b)) return true;
-        Log("[natives] paso %zu sin validar (juego %zu, five %zu)", entries, a, b);
+    if (ResolveViaExports()) {
+        Log("[natives] %s", g_status);
+        return true;
+    }
+
+    Log("[natives] exportaciones sin resultado, se prueba el cosechado");
+    for (auto& m : modules::All()) {
+        std::string l = Lower(m.name);
+        if (l.find("gtaprocess") == std::string::npos && l.find("gta5") == std::string::npos) continue;
+
+        const size_t n = TryHarvestBlocks(m);
+        Log("[natives] %s: %zu bloques", m.name.c_str(), n);
+        if (n && Validate()) {
+            g_status = "resueltas (cosecha)";
+            Log("[natives] cosechadas %zu nativas", g_map.size());
+            return true;
+        }
     }
 
     g_status = "tabla de nativas no encontrada";
