@@ -13,6 +13,7 @@ struct Config {
     // render (overlay=0) o sin subclase de ventana (wndproc=0).
     bool autoOpen       = true;
     bool hookWndProc    = true;
+    bool nativesEnabled = true;
 };
 
 namespace config {

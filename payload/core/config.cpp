@@ -36,6 +36,7 @@ void Apply(const char* key, size_t keyLen, const char* val, size_t valLen) {
     else if (Same(key, keyLen, "log_level"))      g_config.logLevel = (int)n;
     else if (Same(key, keyLen, "auto_open"))      g_config.autoOpen = n != 0;
     else if (Same(key, keyLen, "wndproc"))        g_config.hookWndProc = n != 0;
+    else if (Same(key, keyLen, "natives"))        g_config.nativesEnabled = n != 0;
 }
 
 // Se llama siempre con el lock tomado: nunca reentra en Save().
@@ -60,14 +61,16 @@ void SaveLocked() {
         "debug_console=%d\r\n"
         "log_level=%d\r\n"
         "auto_open=%d\r\n"
-        "wndproc=%d\r\n",
+        "wndproc=%d\r\n"
+        "natives=%d\r\n",
         g_config.menuKey,
         g_config.loadOnStart ? 1 : 0,
         g_config.overlayEnabled ? 1 : 0,
         g_config.debugConsole ? 1 : 0,
         g_config.logLevel,
         g_config.autoOpen ? 1 : 0,
-        g_config.hookWndProc ? 1 : 0);
+        g_config.hookWndProc ? 1 : 0,
+        g_config.nativesEnabled ? 1 : 0);
 
     DWORD put = 0;
     WriteFile(h, buf, (DWORD)n, &put, nullptr);

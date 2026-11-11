@@ -168,6 +168,14 @@ static DWORD WINAPI UnloadThread(LPVOID) {
     return 0;
 }
 
+static DWORD WINAPI NativesThread(LPVOID) {
+    Sleep(2000);
+    if (!config::Get().nativesEnabled) { BootMark("nativas desactivadas"); return 0; }
+    if (Stage("natives", [] { return native::init(); })) BootMark("nativas ok");
+    else BootMark("nativas fallo");
+    return 0;
+}
+
 static DWORD WINAPI Init(LPVOID) {
     BootMark("Init arranca");
     Sleep(60);
@@ -208,9 +216,7 @@ static DWORD WINAPI Init(LPVOID) {
         BootMark("overlay desactivado en config");
     }
 
-    // Solo dos modulos, patrones cortos y validacion con hashes conocidos: son
-    // milisegundos, no el barrido de 200 modulos que haciamos con Lua.
-    if (window) Stage("natives", [] { return native::init(); });
+    if (window) CloseHandle(CreateThread(nullptr, 0, NativesThread, nullptr, 0, nullptr));
 
     BootMark("listo");
     Log("[core] listo");
