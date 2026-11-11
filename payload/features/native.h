@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+
 struct lua_State;
 
 namespace native {
@@ -28,14 +31,12 @@ void setAimHold(bool v);
 void setFov(float v);
 void setSmooth(float v);
 
+void rearm();
 bool init();
 void shutdown();
+
 void tick();
 void render();
 void renderMenu();
-void rearm();
-
-void addLuaFields(lua_State* L);
-void onLuaState(lua_State* L);
 
 } // namespace native

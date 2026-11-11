@@ -1,14 +1,12 @@
 #include "features/native.h"
-#include "core/lua_runtime.h"
+#include "features/natives.h"
 #include "utils/log.h"
 
 #include <Windows.h>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <algorithm>
 
 #include "imgui.h"
 
@@ -21,18 +19,10 @@ std::atomic<bool>  g_skel{ true }, g_aimHold{ false };
 std::atomic<float> g_fov{ 90.0f };
 std::atomic<float> g_smooth{ 0.55f };
 
-std::atomic<bool> g_installed{ false };
-std::atomic<bool> g_queued{ false };
-const char* g_status = "esperando runtime Lua";
+std::atomic<bool> g_up{ false };
+const char* g_status = "sin iniciar";
 
-// ---------------------------------------------------------------- snapshot
-
-constexpr size_t kBufSize = 24576;
-char g_buf[2][kBufSize];
-std::atomic<int>  g_slot{ 0 };
-std::atomic<bool> g_fresh{ false };
-
-constexpr int kMaxBones = 24;
+constexpr int kMaxBones = 20;
 
 struct BonePt { int id; float x, y; };
 
@@ -49,250 +39,195 @@ struct Frame {
 };
 
 Frame g_frame;
+ULONGLONG g_lastTick = 0;
 
-// ---------------------------------------------------------------- api Lua
+// --------------------------------------------------------------- helpers
 
-int api_opt(lua_State* L) {
-    size_t len = 0;
-    const char* k = lua::GetStringArg(L, 1, len);
-    if (k && len) {
-        char tmp[24]{};
-        memcpy(tmp, k, len < 23 ? len : 23);
-        if (!strcmp(tmp, "esp"))     { lua::PushInteger(L, g_esp ? 1 : 0); return 1; }
-        if (!strcmp(tmp, "box"))     { lua::PushInteger(L, g_box ? 1 : 0); return 1; }
-        if (!strcmp(tmp, "skel"))    { lua::PushInteger(L, g_skel ? 1 : 0); return 1; }
-        if (!strcmp(tmp, "aim"))     { lua::PushInteger(L, g_aim ? 1 : 0); return 1; }
-        if (!strcmp(tmp, "god"))     { lua::PushInteger(L, g_god ? 1 : 0); return 1; }
-        if (!strcmp(tmp, "jump"))    { lua::PushInteger(L, g_jump ? 1 : 0); return 1; }
-        if (!strcmp(tmp, "aimhold")) { lua::PushInteger(L, g_aimHold ? 1 : 0); return 1; }
-        if (!strcmp(tmp, "fov"))     { lua::PushInteger(L, static_cast<int>(g_fov)); return 1; }
-        if (!strcmp(tmp, "smooth"))  { lua::PushInteger(L, static_cast<int>(g_smooth * 100.0f)); return 1; }
-    }
-    lua::PushInteger(L, 0);
-    return 1;
+int64_t Arg0(uint64_t a) { return static_cast<int64_t>(a); }
+
+int64_t NPlayerId()     { return natives::v_int(0x4F8644AF03D0E0D6, 0, nullptr); }
+int64_t NPed()          { return natives::v_int(0xD80958FC74E988A6, 0, nullptr); }
+
+bool GetCoords(int64_t ent, Vec3& out) {
+    alignas(16) uint8_t ret[64]{};
+    uint64_t args[2] = { static_cast<uint64_t>(ent), 1 };
+    if (!natives::call(0x3FEF770D40960D5A, ret, 2, args)) return false;
+    memcpy(&out, ret, sizeof(Vec3));
+    return out.x != 0.0f || out.y != 0.0f || out.z != 0.0f;
 }
 
-int api_publish(lua_State* L) {
-    size_t len = 0;
-    const char* s = lua::GetStringArg(L, 1, len);
-    if (!s) return 0;
-
-    const int next = 1 - g_slot.load(std::memory_order_relaxed);
-    const size_t n = len < kBufSize - 1 ? len : kBufSize - 1;
-    memcpy(g_buf[next], s, n);
-    g_buf[next][n] = '\0';
-    g_slot.store(next, std::memory_order_release);
-    g_fresh.store(true, std::memory_order_release);
-
-    // Que el script publique es la senal real de que esta vivo: no hace falta
-    // que nadie marque "instalado" desde otro hilo.
-    if (!g_installed.exchange(true)) {
-        g_status = "activo";
-        Log("[native] script de snapshot activo");
-    }
-    return 0;
-}
-
-// ---------------------------------------------------------------- script
-
-const char* kScript = R"LUA(
-local fmt = string.format
-local function opt(k) return cheat.opt(k) end
-
-local function w2s(x, y, z, sw, sh)
-    local ok, sx, sy = GetScreenCoordFromWorldCoord(x, y, z)
-    if not ok or not sx or not sy then return nil end
-    return sx * sw, sy * sh
-end
-
-local relH, relP, lastT = 0.0, 0.0, -1
-
-Citizen.CreateThread(function()
-    while true do
-        Citizen.Wait(0)
-
-        local me   = PlayerId()
-        local ped  = PlayerPedId()
-        local god  = opt("god") == 1
-        local jump = opt("jump") == 1
-
-        if god then
-            SetPlayerInvincible(me, true)
-            if ped and ped ~= 0 then SetEntityInvincible(ped, true) end
-        end
-        if jump then SetSuperJumpThisFrame(me) end
-
-        local sw, sh = GetActiveScreenResolution()
-        if not sw or sw == 0 then sw, sh = 1920, 1080 end
-
-        local aim = opt("aim") == 1
-        local hold = opt("aimhold") == 1
-        if aim and hold and not IsControlPressed(0, 25) then aim = false end
-
-        local selfC = GetEntityCoords(ped, true)
-        local fov = opt("fov") + 0.0
-
-        if aim and ped and ped ~= 0 then
-            local best, bestD, bestPos = -1, fov, nil
-            local cx, cy = sw * 0.5, sh * 0.5
-
-            for i = 0, 31 do
-                if i ~= me and IsPlayerActive(i) then
-                    local oped = GetPlayerPed(i)
-                    if oped and oped ~= 0 then
-                        local oc = GetEntityCoords(oped, true)
-                        local dx, dy, dz = oc.x - selfC.x, oc.y - selfC.y, oc.z - selfC.z
-                        if dx*dx + dy*dy + dz*dz <= 90000.0 then
-                            local sx, sy = w2s(oc.x, oc.y, oc.z, sw, sh)
-                            if sx then
-                                local d = math.sqrt((sx-cx)^2 + (sy-cy)^2)
-                                if d < bestD then bestD, best, bestPos = d, oped, oc end
-                            end
-                        end
-                    end
-                end
-            end
-
-            if best ~= -1 and bestPos then
-                local dx, dy, dz = bestPos.x - selfC.x, bestPos.y - selfC.y, bestPos.z - selfC.z
-                local horiz = math.sqrt(dx*dx + dy*dy)
-                if horiz > 0.1 then
-                    local bearing = math.deg(math.atan(dx, dy))
-                    local heading = GetEntityHeading(ped)
-                    local pitch = -math.deg(math.atan(dz, horiz))
-                    local rel = bearing - heading
-                    while rel > 180.0 do rel = rel - 360.0 end
-                    while rel < -180.0 do rel = rel + 360.0 end
-
-                    if best ~= lastT or math.abs(rel - relH) > 60.0 then
-                        relH, relP, lastT = rel, pitch, best
-                    else
-                        local k = opt("smooth") / 100.0
-                        relH = relH + (rel - relH) * k
-                        relP = relP + (pitch - relP) * k
-                    end
-                    SetGameplayCamRelativeHeading(relH)
-                    SetGameplayCamRelativePitch(relP, 1.0)
-                end
-            end
-        end
-
-        local wantEsp  = opt("esp") == 1
-        local wantBox  = opt("box") == 1
-        local wantSkel = opt("skel") == 1
-        if not wantEsp and not wantBox and not wantSkel then
-            cheat.publish(fmt("H %d\n", me))
-        else
-            local out = { fmt("H %d\n", me) }
-
-            for i = 0, 31 do
-                if i ~= me and IsPlayerActive(i) then
-                    local oped = GetPlayerPed(i)
-                    if oped and oped ~= 0 then
-                        local oc = GetEntityCoords(oped, true)
-                        local dx, dy, dz = oc.x - selfC.x, oc.y - selfC.y, oc.z - selfC.z
-                        local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
-                        if dist <= 500.0 then
-                            local fx, fy = w2s(oc.x, oc.y, oc.z, sw, sh)
-                            if fx then
-                                local hc = GetPedBoneCoords(oped, 0, 0.0, 0.0, 0.0)
-                                local hx, hy = w2s(hc.x, hc.y, hc.z, sw, sh)
-                                if not hx then hx, hy = fx, fy - 40.0 end
-
-                                if wantSkel and dist <= 300.0 then
-                                    local bones = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
-                                                    22, 23, 24, 25, 26, 27 }
-                                    for _, b in ipairs(bones) do
-                                        local bc = GetPedBoneCoords(oped, b, 0.0, 0.0, 0.0)
-                                        local bx, by = w2s(bc.x, bc.y, bc.z, sw, sh)
-                                        if bx then out[#out+1] = fmt("B %d %.1f %.1f\n", b, bx, by) end
-                                    end
-                                end
-
-                                local name = GetPlayerName(i) or "jugador"
-                                name = string.gsub(name, "%s+", "_")
-                                out[#out+1] = fmt("P %d %.1f %d %.1f %.1f %.1f %.1f %s\n",
-                                    i, dist, GetEntityHealth(oped), hx, hy, fx, fy, name)
-                            end
-                        end
-                    end
-                end
-            end
-
-            cheat.publish(table.concat(out))
-        end
-    end
-end)
-)LUA";
-
-// Nunca se ejecuta Lua desde aqui: se encola y lo vacia el hook, que corre en
-// el hilo del juego. Ejecutar RunString desde el hilo del render es carrera con
-// el runtime y acaba en crash.
-void Install() {
-    if (g_installed || !lua::ready()) return;
-    if (g_queued.exchange(true)) return;
-    lua::PushPending("@cheat_snap", kScript);
-    g_status = "script en cola";
-}
-
-// ---------------------------------------------------------------- parser
-
-bool ParseFrame() {
-    if (!g_fresh.exchange(false)) return false;
-
-    const int slot = g_slot.load(std::memory_order_acquire);
-    const char* p = g_buf[slot];
-    if (!p[0]) return false;
-
-    memset(&g_frame, 0, sizeof(g_frame));
-    g_frame.me = -1;
-
-    while (*p) {
-        while (*p == '\n' || *p == '\r') ++p;
-        if (!*p) break;
-
-        const char tag = *p;
-        if (tag == 'H') {
-            g_frame.me = atoi(p + 1);
-        } else if (tag == 'B' && g_frame.count > 0) {
-            const int idx = g_frame.count - 1;
-            if (g_frame.boneCount[idx] < kMaxBones) {
-                const char* q = p + 1;
-                BonePt& b = g_frame.bones[idx][g_frame.boneCount[idx]];
-                b.id = atoi(q);
-                while (*q == ' ') ++q;
-                while (*q && *q != ' ') ++q;
-                b.x = (float)atof(q);
-                while (*q == ' ') ++q;
-                while (*q && *q != ' ') ++q;
-                b.y = (float)atof(q);
-                ++g_frame.boneCount[idx];
-            }
-        } else if (tag == 'P' && g_frame.count < 32) {
-            const int idx = g_frame.count;
-            const char* q = p + 1;
-            g_frame.slot[idx] = atoi(q);
-            while (*q == ' ') ++q; while (*q && *q != ' ') ++q;
-            g_frame.dist[idx] = (float)atof(q);
-            while (*q == ' ') ++q; while (*q && *q != ' ') ++q;
-            g_frame.hp[idx] = atoi(q);
-            for (int k = 0; k < 4; ++k) {
-                while (*q == ' ') ++q; while (*q && *q != ' ') ++q;
-                g_frame.box[idx][k] = (float)atof(q);
-            }
-            while (*q == ' ') ++q;
-            size_t n = 0;
-            while (*q && *q != ' ' && *q != '\n' && *q != '\r' && n < 27) {
-                char c = *q++;
-                g_frame.name[idx][n++] = (c == '_') ? ' ' : c;
-            }
-            g_frame.name[idx][n] = '\0';
-            ++g_frame.count;
-        }
-
-        while (*p && *p != '\n') ++p;
-    }
+bool W2S(const Vec3& p, float sw, float sh, float& sx, float& sy) {
+    alignas(16) uint8_t ret[64]{};
+    uint64_t args[3] = { 0, 0, 0 };
+    float xyz[3] = { p.x, p.y, p.z };
+    memcpy(&args[0], &xyz[0], 4);
+    memcpy(&args[1], &xyz[1], 4);
+    memcpy(&args[2], &xyz[2], 4);
+    if (!natives::call(0x34E82F05DF2974F5, ret, 3, args)) return false;
+    const bool on = *reinterpret_cast<uint8_t*>(ret) != 0;
+    const float ox = *reinterpret_cast<float*>(ret + 8);
+    const float oy = *reinterpret_cast<float*>(ret + 16);
+    if (!on) return false;
+    sx = ox * sw;
+    sy = oy * sh;
     return true;
+}
+
+bool BoneCoords(int64_t ped, int bone, Vec3& out) {
+    alignas(16) uint8_t ret[64]{};
+    uint64_t args[5] = { static_cast<uint64_t>(ped), static_cast<uint64_t>(bone), 0, 0, 0 };
+    if (!natives::call(0x17C07FC640E86B4E, ret, 5, args)) return false;
+    memcpy(&out, ret, sizeof(Vec3));
+    return true;
+}
+
+void PlayerName(int64_t slot, char* out, size_t n) {
+    if (out && n) out[0] = '\0';
+    if (!natives::has(0x6D0DE6A7B5DA71F8)) return;
+    alignas(16) uint8_t ret[64]{};
+    uint64_t args[1] = { static_cast<uint64_t>(slot) };
+    if (!natives::call(0x6D0DE6A7B5DA71F8, ret, 1, args)) return;
+    const char* s = *reinterpret_cast<const char**>(ret);
+    if (!s) return;
+    size_t i = 0;
+    for (; s[i] && i + 1 < n; ++i) out[i] = (s[i] == ' ') ? '_' : s[i];
+    out[i] = '\0';
+}
+
+// --------------------------------------------------------------- features
+
+void DoGod() {
+    if (!natives::has(0x239528EACDC3E7DE)) return;
+    const int64_t me = NPlayerId();
+    const int64_t ped = NPed();
+    uint64_t a1[2] = { static_cast<uint64_t>(me), 1 };
+    natives::v_void(0x239528EACDC3E7DE, 2, a1);
+    if (ped && natives::has(0x3882114BDE571AD4)) {
+        uint64_t a2[2] = { static_cast<uint64_t>(ped), 1 };
+        natives::v_void(0x3882114BDE571AD4, 2, a2);
+    }
+}
+
+void DoJump() {
+    if (!natives::has(0x57FFF03E423A4C0B)) return;
+    uint64_t a[1] = { static_cast<uint64_t>(NPlayerId()) };
+    natives::v_void(0x57FFF03E423A4C0B, 1, a);
+}
+
+void DoAim(const Vec3& self, float sw, float sh) {
+    if (!natives::has(0x14D6F5678D8F1B37) || !natives::has(0xC2AB6BF4E8A9C5F7)) return;
+
+    const float fovPx = g_fov;
+    const float cx = sw * 0.5f, cy = sh * 0.5f;
+    int64_t best = 0;
+    float bestD = fovPx;
+    Vec3 bestPos{};
+
+    for (int i = 0; i < 32; ++i) {
+        if (i == g_frame.me) continue;
+        uint64_t a[1] = { static_cast<uint64_t>(i) };
+        if (!natives::v_int(0xB8DFD30D6973E135, 1, a)) continue;
+
+        alignas(16) uint8_t ret[64]{};
+        uint64_t ap[1] = { static_cast<uint64_t>(i) };
+        if (!natives::call(0x43A66C31C68491C0, ret, 1, ap)) continue;
+        const int64_t oped = *reinterpret_cast<int64_t*>(ret);
+        if (!oped) continue;
+
+        Vec3 oc{};
+        if (!GetCoords(oped, oc)) continue;
+        const float dx = oc.x - self.x, dy = oc.y - self.y, dz = oc.z - self.z;
+        if (dx * dx + dy * dy + dz * dz > 90000.0f) continue;
+
+        float sx, sy;
+        if (!W2S(oc, sw, sh, sx, sy)) continue;
+        const float d = sqrtf((sx - cx) * (sx - cx) + (sy - cy) * (sy - cy));
+        if (d < bestD) { bestD = d; best = oped; bestPos = oc; }
+    }
+    if (!best) return;
+
+    alignas(16) uint8_t cam[64]{};
+    if (!natives::call(0x14D6F5678D8F1B37, cam, 0, nullptr)) return;
+    Vec3 cc{};
+    memcpy(&cc, cam, sizeof(Vec3));
+
+    const float dx = bestPos.x - cc.x, dy = bestPos.y - cc.y, dz = bestPos.z - cc.z;
+    const float horiz = sqrtf(dx * dx + dy * dy);
+    if (horiz < 0.1f) return;
+
+    const float bearing = atan2f(dx, dy) * 57.29578f;
+    const float pitch   = -atan2f(dz, horiz) * 57.29578f;
+
+    uint64_t ah[1] = { 0 };
+    float bh = bearing;
+    memcpy(&ah[0], &bh, 4);
+    natives::v_void(0xC2AB6BF4E8A9C5F7, 1, ah);
+
+    if (natives::has(0x2F5C4B1C1C7E1A28)) {
+        uint64_t ap[2] = { 0, 0 };
+        float bp = pitch, one = 1.0f;
+        memcpy(&ap[0], &bp, 4);
+        memcpy(&ap[1], &one, 4);
+        natives::v_void(0x2F5C4B1C1C7E1A28, 2, ap);
+    }
+}
+
+void BuildEsp(const Vec3& self, float sw, float sh) {
+    memset(&g_frame, 0, sizeof(g_frame));
+    g_frame.me = static_cast<int>(NPlayerId());
+
+    const bool wantEsp = g_esp, wantBox = g_box, wantSkel = g_skel;
+    if (!wantEsp && !wantBox && !wantSkel) return;
+
+    for (int i = 0; i < 32; ++i) {
+        if (i == g_frame.me) continue;
+        uint64_t a[1] = { static_cast<uint64_t>(i) };
+        if (!natives::v_int(0xB8DFD30D6973E135, 1, a)) continue;
+
+        alignas(16) uint8_t ret[64]{};
+        uint64_t ap[1] = { static_cast<uint64_t>(i) };
+        if (!natives::call(0x43A66C31C68491C0, ret, 1, ap)) continue;
+        const int64_t oped = *reinterpret_cast<int64_t*>(ret);
+        if (!oped) continue;
+
+        Vec3 oc{};
+        if (!GetCoords(oped, oc)) continue;
+        const float dx = oc.x - self.x, dy = oc.y - self.y, dz = oc.z - self.z;
+        const float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (dist > 500.0f) continue;
+
+        float fx, fy;
+        if (!W2S(oc, sw, sh, fx, fy)) continue;
+
+        Vec3 hc{};
+        float hx = fx, hy = fy - 40.0f;
+        if (BoneCoords(oped, 0, hc) && W2S(hc, sw, sh, hx, hy)) { /* ok */ }
+
+        const int idx = g_frame.count;
+        if (idx >= 32) break;
+        g_frame.slot[idx] = i;
+        g_frame.dist[idx] = dist;
+        g_frame.box[idx][0] = fx;
+        g_frame.box[idx][1] = hy;
+        g_frame.box[idx][2] = fx;
+        g_frame.box[idx][3] = fy;
+        g_frame.hp[idx] = static_cast<int>(natives::v_int(0xEEF059FAD016D209, 1, ap));
+        PlayerName(i, g_frame.name[idx], sizeof(g_frame.name[idx]));
+
+        if (wantSkel && dist <= 300.0f) {
+            static const int kBones[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 };
+            for (int b : kBones) {
+                Vec3 bc{};
+                if (!BoneCoords(oped, b, bc)) continue;
+                float bx, by;
+                if (!W2S(bc, sw, sh, bx, by)) continue;
+                if (g_frame.boneCount[idx] >= kMaxBones) break;
+                BonePt& p = g_frame.bones[idx][g_frame.boneCount[idx]++];
+                p.id = b; p.x = bx; p.y = by;
+            }
+        }
+        ++g_frame.count;
+    }
 }
 
 void Draw() {
@@ -308,10 +243,9 @@ void Draw() {
         const float boxW = boxH * 0.42f;
         const float cx = (x0 + x1) * 0.5f;
 
-        if (g_box) {
+        if (g_box)
             dl->AddRect(ImVec2(cx - boxW * 0.5f, y0), ImVec2(cx + boxW * 0.5f, y1),
                         IM_COL32(0, 255, 128, 200), 0.0f, 0, 1.5f);
-        }
 
         if (g_skel && g_frame.boneCount[i] > 1) {
             for (int k = 1; k < g_frame.boneCount[i]; ++k) {
@@ -323,8 +257,8 @@ void Draw() {
 
         if (g_esp) {
             char label[96]{};
-            snprintf(label, sizeof(label), "%s\n%d hp\n%.0f m",
-                     g_frame.name[i][0] ? g_frame.name[i] : "jugador", g_frame.hp[i], g_frame.dist[i]);
+            const char* nm = g_frame.name[i][0] ? g_frame.name[i] : "jugador";
+            snprintf(label, sizeof(label), "%s\n%d hp\n%.0f m", nm, g_frame.hp[i], g_frame.dist[i]);
             dl->AddText(ImVec2(cx + boxW * 0.55f, y0), IM_COL32(0, 255, 128, 255), label);
         }
     }
@@ -333,8 +267,8 @@ void Draw() {
 
 namespace native {
 
-bool ready() { return g_installed.load() && lua::ready(); }
-bool usingMatrix() { return true; }
+bool ready() { return g_up.load() && natives::ready(); }
+bool usingMatrix() { return false; }
 const char* statusText() { return g_status; }
 
 bool esp()     { return g_esp; }
@@ -358,52 +292,57 @@ void setFov(float v)    { g_fov = v; }
 void setSmooth(float v) { g_smooth = v; }
 
 void rearm() {
-    g_installed = false;
-    g_queued = false;
-    g_fresh = false;
+    g_up = false;
     g_status = "rearme manual";
-    Log("rearme del script solicitado");
-    Install();
+    Log("rearme de nativas solicitado");
+    if (natives::init()) { g_up = true; g_status = "activo"; }
 }
 
 bool init() {
-    if (!lua::ready()) {
-        g_status = "runtime Lua no disponible";
-        return false;
-    }
-    Install();
-    return g_installed.load();
+    if (!natives::init()) { g_status = natives::statusText(); return false; }
+    g_up = true;
+    g_status = "activo";
+    Log("[native] nativas listas");
+    return true;
 }
 
-void shutdown() {
-    g_installed = false;
-    g_queued = false;
-    g_fresh = false;
-}
-
-void addLuaFields(lua_State* L) {
-    lua::AddField(L, "opt", api_opt);
-    lua::AddField(L, "publish", api_publish);
-}
-
-void onLuaState(lua_State*) {
-    Install();
-}
+void shutdown() { g_up = false; }
 
 void tick() {
-    if (!lua::ready()) {
-        if (g_installed.exchange(false)) g_status = "runtime Lua perdido";
-        return;
+    if (!ready()) return;
+
+    const ULONGLONG now = GetTickCount64();
+    if (now - g_lastTick < 4) return;   // ~250 Hz max, no saturar el Present
+    g_lastTick = now;
+
+    const int64_t ped = NPed();
+    if (!ped) return;
+
+    Vec3 self{};
+    if (!GetCoords(ped, self)) return;
+
+    if (g_god)  DoGod();
+    if (g_jump) DoJump();
+
+    float sw = 1920.0f, sh = 1080.0f;
+    if (natives::has(0x2E397A4B1C4B6F4F)) {
+        alignas(16) uint8_t res[64]{};
+        if (natives::call(0x2E397A4B1C4B6F4F, res, 0, nullptr)) {
+            const int w = *reinterpret_cast<int*>(res);
+            const int h = *reinterpret_cast<int*>(res + 8);
+            if (w > 0 && h > 0) { sw = static_cast<float>(w); sh = static_cast<float>(h); }
+        }
     }
-    if (!g_installed) Install();
+
+    BuildEsp(self, sw, sh);
+
+    bool wantAim = g_aim;
+    if (wantAim && g_aimHold && !(GetAsyncKeyState(VK_RBUTTON) & 0x8000)) wantAim = false;
+    if (wantAim) DoAim(self, sw, sh);
 }
 
 void render() {
-    if (!ready()) return;
-    if (!ImGui::GetCurrentContext()) return;
-    // El frame se consume siempre: si se sale antes sin parsear, al reactivar el
-    // ESP se pinta un frame viejo con coordenadas de hace rato.
-    if (!ParseFrame()) return;
+    if (!ready() || !ImGui::GetCurrentContext()) return;
     if (g_esp || g_box || g_skel) Draw();
 }
 
@@ -430,10 +369,10 @@ void renderMenu() {
     if (ImGui::Checkbox("Superjump", &j))  g_jump = j;
 
     ImGui::Separator();
-    ImGui::Text("modo: lua");
+    ImGui::Text("modo: nativo");
     ImGui::Text("entidades: %d", g_frame.count);
     ImGui::Text("alcance: 500 m");
 
-    if (!g_installed && ImGui::Button("Reintentar")) rearm();
+    if (!g_up && ImGui::Button("Reintentar")) rearm();
 }
 } // namespace native

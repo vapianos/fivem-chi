@@ -1,16 +1,12 @@
 #include <windows.h>
-#include <MinHook.h>
 #include <psapi.h>
 #include <dbghelp.h>
 #include <string>
 #include "utils/log.h"
 #include "utils/paths.h"
 #include "core/config.h"
-#include "core/lua_runtime.h"
-#include "core/hooks.h"
 #include "features/native.h"
 #include "render/overlay.h"
-#include "features/script_loader.h"
 
 static HMODULE   g_self     = nullptr;
 static uintptr_t g_base     = 0;
@@ -43,8 +39,6 @@ static void BootMark(const char* text) {
     CloseHandle(h);
 }
 
-// Devuelve lo que devuelva el paso, no "si no hubo excepcion": antes cualquier
-// Stage era true y el llamante no podia distinguir un fallo.
 template <typename F>
 static bool Stage(const char* name, F&& fn) {
     try {
@@ -80,7 +74,6 @@ static bool ModuleNameOf(uintptr_t addr, char* out, size_t outLen, uintptr_t* mo
             return true;
         }
     }
-
     if (g_size && addr >= g_base && addr < g_base + g_size) {
         GetModuleFileNameA(g_self, out, (DWORD)outLen);
         if (modBase) *modBase = g_base;
@@ -167,32 +160,11 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
 static DWORD WINAPI UnloadThread(LPVOID) {
     Sleep(150);
     overlay::shutdown();
-    hooks::shutdown();
     native::shutdown();
-    lua::shutdown();
-    MH_DisableHook(MH_ALL_HOOKS);
-    MH_Uninitialize();
     BootMark("descargado");
     Log("[core] descargado");
     LogShutdown();
     ExitThread(0);
-    return 0;
-}
-
-// Cada reintento reescanea modulos: no conviene pasar de 4.
-static DWORD WINAPI LuaThread(LPVOID) {
-    bool ok = false;
-    for (int i = 0; i < 4 && !ok; ++i) {
-        ok = lua::init();
-        if (!ok) Sleep(2000);
-    }
-    if (!ok) { BootMark("lua fallo"); return 0; }
-
-    BootMark("lua ok");
-    if (!Stage("hooks", [] { return hooks::init(); })) return 0;
-
-    Sleep(500);
-    if (config::Get().loadOnStart) Stage("scripts", [] { scripts::load_all(); return true; });
     return 0;
 }
 
@@ -212,20 +184,6 @@ static DWORD WINAPI Init(LPVOID) {
 
     Stage("config", [] { config::Load(); return true; });
 
-    bool mhook = false;
-    Stage("minhook", [&] {
-        MH_STATUS st = MH_ERROR_MEMORY_ALLOC;
-        for (int i = 0; i < 5 && st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED; ++i) {
-            st = MH_Initialize();
-            if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) Sleep(200);
-        }
-        // Ya inicializado tambien vale: antes esto dejaba mhook en false y el
-        // hilo de Lua no se lanzaba nunca.
-        mhook = (st == MH_OK || st == MH_ERROR_ALREADY_INITIALIZED);
-        Log(mhook ? "[core] MinHook listo" : "[core] MinHook no disponible");
-        return mhook;
-    });
-
     bool window = false;
     Stage("ventana", [&] {
         for (int i = 0; i < 480 && !window; ++i) {
@@ -238,7 +196,6 @@ static DWORD WINAPI Init(LPVOID) {
 
     if (!window) BootMark("sin ventana, el overlay no se puede armar");
 
-    // Overlay PRIMERO: Insert tiene que responder aunque los natives no esten.
     if (config::Get().overlayEnabled) {
         Sleep(700);
         bool armed = false;
@@ -251,8 +208,9 @@ static DWORD WINAPI Init(LPVOID) {
         BootMark("overlay desactivado en config");
     }
 
-    if (window) Stage("native_scan", [] { native::init(); return true; });
-    if (mhook)  CloseHandle(CreateThread(nullptr, 0, LuaThread, nullptr, 0, nullptr));
+    // Solo dos modulos, patrones cortos y validacion con hashes conocidos: son
+    // milisegundos, no el barrido de 200 modulos que haciamos con Lua.
+    if (window) Stage("natives", [] { return native::init(); });
 
     BootMark("listo");
     Log("[core] listo");
@@ -268,7 +226,6 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD r, LPVOID) {
     if (r == DLL_PROCESS_ATTACH) {
         g_self = h;
         DisableThreadLibraryCalls(h);
-        // Nada de E/S bajo el loader lock: BootMark usa ficheros y puede colgar.
         CloseHandle(CreateThread(nullptr, 0, Init, nullptr, 0, nullptr));
     }
     return TRUE;

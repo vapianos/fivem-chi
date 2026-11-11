@@ -3,7 +3,6 @@
 #include "features/native.h"
 #include "core/config.h"
 #include "utils/paths.h"
-#include "features/script_loader.h"
 
 #include <Windows.h>
 #include "imgui.h"
@@ -34,9 +33,10 @@ static void BootLogTail() {
         SetFilePointerEx(f, at, nullptr, FILE_BEGIN);
     }
 
-    char buf[kTake + 1]{};
+    static char buf[kTake + 1]{};
     DWORD got = 0;
     ReadFile(f, buf, (DWORD)kTake, &got, nullptr);
+    buf[got < kTake ? got : kTake] = '\0';
     CloseHandle(f);
     ImGui::TextUnformatted(buf);
 }
@@ -55,15 +55,6 @@ void Render() {
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Lua")) {
-            ImGui::Text("carpeta:");
-            ImGui::TextWrapped("%s", paths::ToUtf8(paths::LuaDir()).c_str());
-            ImGui::Separator();
-            if (ImGui::Button("Recargar scripts")) scripts::load_all();
-            ImGui::TextDisabled("Los toggles de arriba son nativos y no dependen de Lua.");
-            ImGui::EndTabItem();
-        }
-
         if (ImGui::BeginTabItem("Ajustes")) {
             Config& c = config::Get();
             int key = c.menuKey;
@@ -73,22 +64,24 @@ void Render() {
             }
             ImGui::TextDisabled("Insert siempre funciona, aunque cambies esto.");
 
-            bool autoLoad = c.loadOnStart;
-            if (ImGui::Checkbox("Cargar scripts al iniciar", &autoLoad)) c.loadOnStart = autoLoad;
+            bool autoOpen = c.autoOpen;
+            if (ImGui::Checkbox("Abrir el menu al armar", &autoOpen)) c.autoOpen = autoOpen;
+
+            bool wnd = c.hookWndProc;
+            if (ImGui::Checkbox("Enganchar el WndProc", &wnd)) c.hookWndProc = wnd;
 
             if (ImGui::Button("Guardar")) config::Save();
             ImGui::EndTabItem();
         }
 
         if (ImGui::BeginTabItem("Estado")) {
-            ImGui::Text("natives: %s", native::ready() ? "ok" : "no");
+            ImGui::Text("nativas: %s", native::ready() ? "ok" : "no");
             ImGui::Text("detalle: %s", native::statusText());
-            ImGui::Text("proyeccion: %s", native::usingMatrix() ? "matriz" : "native");
             ImGui::Text("overlay: %s", overlay::armed() ? "armado" : "sin armar");
             ImGui::Separator();
             ImGui::TextDisabled("F1 ESP  F2 cajas  F3 aim  F4 god  F5 jump  F6 esqueleto  F8 ocultar");
 
-            if (!native::ready() && ImGui::Button("Reintentar resolucion de natives")) native::rearm();
+            if (!native::ready() && ImGui::Button("Reintentar resolucion de nativas")) native::rearm();
             ImGui::SameLine();
             if (ImGui::Button("Rearmar overlay")) overlay::init();
 

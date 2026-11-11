@@ -6,7 +6,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_EXTENSIONS OFF)
 
-# CRT estatica: el payload no debe depender del MSVCP140/VCRUNTIME140 de FiveM.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING "" FORCE)
 
 if(MSVC)
@@ -52,12 +51,10 @@ target_link_libraries(launcher PRIVATE imgui_lib d3d11 dxgi comdlg32 psapi shell
 add_library(cheat SHARED
     payload/dllmain.cpp
     payload/core/config.cpp
-    payload/core/hooks.cpp
-    payload/core/lua_runtime.cpp
     payload/core/module.cpp
     payload/core/scanner.cpp
     payload/features/native.cpp
-    payload/features/script_loader.cpp
+    payload/features/natives.cpp
     payload/render/menu.cpp
     payload/render/overlay.cpp
     payload/utils/log.cpp
@@ -70,9 +67,6 @@ set_target_properties(cheat PROPERTIES
     OUTPUT_NAME "cheat"
     WIN32_EXECUTABLE TRUE)
 
-# Los scripts Lua tienen que acabar donde paths::LuaDir() los busca.
 add_custom_command(TARGET cheat POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:cheat>/payload
-    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:cheat> $<TARGET_FILE_DIR:cheat>/payload/
-    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/lua $<TARGET_FILE_DIR:cheat>/lua
-    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/lua "$ENV{USERPROFILE}/Documents/VeniceFiveM/lua")
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:cheat> $<TARGET_FILE_DIR:cheat>/payload/)

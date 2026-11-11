@@ -421,9 +421,10 @@ HRESULT PrepareAndDraw(IDXGISwapChain* swap) {
     }
 
     PollKeys();
+
+    // El tick de features llama a nativas: va dentro del __try del hook.
     native::tick();
 
-    // GTA re-recorta el cursor en su propio update: hay que reafirmarlo.
     if (g_visible) ClipCursor(nullptr);
 
     if (!g_visible && g_autoShowAt && GetTickCount64() > g_autoShowAt) {
