@@ -9,6 +9,7 @@
 #include <dxgi.h>
 #include <dxgi1_2.h>
 #include <atomic>
+#include <exception>
 
 #include "imgui.h"
 #include "imgui_internal.h"
