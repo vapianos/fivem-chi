@@ -26,14 +26,16 @@ using Present_t    = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT);
 using Present1_t   = HRESULT(__stdcall*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
 using ResizeBuf_t  = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 
-// Indices reales de IDXGISwapChain / IDXGISwapChain1:
-//   IDXGIObject 0-6, IDXGIDeviceSubObject 7, Present 8, ResizeBuffers 13,
-//   IDXGISwapChain1: GetDesc1 18, GetFullscreenDesc 19, GetHwnd 20,
-//   GetCoreWindow 21, Present1 22.
-// El 18 NO es Present1: escribir ahi rompe GetDesc1 y deja Present1 sin hookear.
+// IDXGIObject 0-6, IDXGIDeviceSubObject 7, Present 8, ResizeBuffers 13,
+// IDXGISwapChain1: GetDesc1 18, GetFullscreenDesc 19, GetHwnd 20,
+// GetCoreWindow 21, Present1 22.
 constexpr size_t kIdxPresent  = 8;
 constexpr size_t kIdxResize   = 13;
 constexpr size_t kIdxPresent1 = 22;
+
+// Tras este numero de fallos seguidos se desarma el overlay en vez de dejar
+// que el proceso acabe palmando.
+constexpr int kFaultLimit = 30;
 
 Present_t   o_present  = nullptr;
 Present1_t  o_present1 = nullptr;
@@ -45,7 +47,7 @@ ID3D11Device*           g_device  = nullptr;
 ID3D11DeviceContext*    g_context = nullptr;
 ID3D11RenderTargetView* g_rtv     = nullptr;
 HWND                    g_hwnd    = nullptr;
-IDXGISwapChain*         g_swap    = nullptr;   // swapchain al que pertenece todo lo de arriba
+IDXGISwapChain*         g_swap    = nullptr;
 
 std::atomic<bool> g_visible{ false };
 std::atomic<bool> g_toggleReq{ false };
@@ -53,6 +55,7 @@ volatile bool     g_ready        = false;
 volatile bool     g_armed        = false;
 volatile bool     g_inPresent    = false;
 volatile bool     g_shuttingDown = false;
+volatile bool     g_dead         = false;
 bool              g_loggedFirst  = false;
 ULONGLONG         g_frames       = 0;
 ULONGLONG         g_autoShowAt   = 0;
@@ -126,8 +129,6 @@ void SaveState(D3DState& s) {
 }
 
 void RestoreState(D3DState& s) {
-    // Los enlaces se restauran solo si hay contexto; las referencias se sueltan
-    // siempre para no filtrar si el contexto desaparecio a media faena.
     if (g_context) {
         g_context->OMSetRenderTargets(1, &s.rtv, s.dsv);
         if (s.viewports) g_context->RSSetViewports(s.viewports, &s.vp);
@@ -244,8 +245,6 @@ void PollKeys() {
     }
 }
 
-// Corre en el hilo propietario de grcWindow, o sea el principal del juego: si
-// algo peta aqui, FiveM lo ve como salida temprana. Nada sin guardar.
 LRESULT CALLBACK hkWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (!o_wndproc) return DefWindowProcW(hwnd, msg, wp, lp);
     if (!g_visible) return CallWindowProcW(o_wndproc, hwnd, msg, wp, lp);
@@ -295,9 +294,7 @@ bool Setup(IDXGISwapChain* swap) {
     g_hwnd = desc.OutputWindow;
     g_swap = swap;
 
-    if (!CreateRtv(swap)) {
-        LogE("sin render target, overlay no dibuja");
-    }
+    if (!CreateRtv(swap)) LogE("sin render target, overlay no dibuja");
 
     if (ImGui::GetCurrentContext()) ImGui::DestroyContext();
     ImGui::CreateContext();
@@ -331,9 +328,7 @@ bool Setup(IDXGISwapChain* swap) {
         Log("WndProc sin enganchar (wndproc=0)");
     }
 
-    if (config::Get().autoOpen) g_autoShowAt = GetTickCount64() + 1500;
-    else                        g_autoShowAt = 0;
-
+    g_autoShowAt = config::Get().autoOpen ? GetTickCount64() + 1500 : 0;
     g_nextSetupAt = 0;
     g_faults = 0;
     g_ready = true;
@@ -356,9 +351,23 @@ void DropDevice() {
     g_ready = false;
 }
 
-void DrawFrame() {
-    if (!g_context) return;
+// Fusible: se desarma solo. El juego sigue vivo con el menu y el ESP apagados.
+void Disarm(const char* why) {
+    LogE("overlay desarmado: %s", why);
+    g_dead = true;
+    if (g_armed) {
+        RestoreSlot(g_vtable, kIdxPresent, reinterpret_cast<void*>(o_present));
+        RestoreSlot(g_vtable, kIdxResize, reinterpret_cast<void*>(o_resize));
+        RestoreSlot(g_vtable, kIdxPresent1, reinterpret_cast<void*>(o_present1));
+        g_armed = false;
+    }
+    if (g_hwnd && o_wndproc)
+        SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(o_wndproc));
+    o_wndproc = nullptr;
+    DropDevice();
+}
 
+void DrawFrameUnsafe() {
     Msg m;
     while (Dequeue(m)) {
         if (ImGui::GetCurrentContext())
@@ -374,39 +383,42 @@ void DrawFrame() {
 
     ImGui::Render();
 
-    // Flip model: el backbuffer que deja el juego ya esta presentado. Hay que
-    // bindear SIEMPRE el RTV propio, se dibuje menu o solo ESP.
     if (g_rtv) {
         g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
     }
 }
 
+void DrawFrame() {
+    if (!g_context) return;
+    try {
+        DrawFrameUnsafe();
+    } catch (const std::exception& e) {
+        LogE("excepcion en el frame: %s", e.what());
+        if (ImGui::GetCurrentContext() && ImGui::GetCurrentContext()->WithinFrameScope)
+            ImGui::EndFrame();
+    }
+}
+
 HRESULT __stdcall hkPresent(IDXGISwapChain* swap, UINT sync, UINT flags);
 HRESULT __stdcall hkPresent1(IDXGISwapChain1* swap, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* p);
 
-HRESULT PrepareAndDraw(IDXGISwapChain* swap) {
+void PrepareAndDraw(IDXGISwapChain* swap) {
     if (!g_ready) {
         const ULONGLONG now = GetTickCount64();
-        if (now < g_nextSetupAt) return S_OK;
+        if (now < g_nextSetupAt) return;
         if (!Setup(swap)) {
             g_nextSetupAt = now + 500;
-            return S_OK;
+            return;
         }
     }
-
-    // Otro swapchain que no es el nuestro: no se le toca el render target,
-    // porque g_rtv pertenece al backbuffer del swapchain de grcWindow.
-    if (swap != g_swap) return S_OK;
-
-    if (!g_rtv && !CreateRtv(swap)) return S_OK;
+    if (swap != g_swap) return;
+    if (!g_rtv && !CreateRtv(swap)) return;
 
     if (!g_loggedFirst) { g_loggedFirst = true; Log("primer Present recibido"); }
     ++g_frames;
 
     if (g_armed && g_frames % 120 == 0) {
-        // Re-enganche con las funciones reales, nunca con lambdas: una llamada
-        // swap->Present() vuelve a pasar por vtable[8] y se queda en bucle.
         if (g_vtable[kIdxPresent] != reinterpret_cast<void*>(&hkPresent)) {
             if (g_vtable[kIdxPresent]) o_present = reinterpret_cast<Present_t>(g_vtable[kIdxPresent]);
             PatchSlot(g_vtable, kIdxPresent, reinterpret_cast<void*>(&hkPresent), nullptr);
@@ -421,8 +433,6 @@ HRESULT PrepareAndDraw(IDXGISwapChain* swap) {
     }
 
     PollKeys();
-
-    // El tick de features llama a nativas: va dentro del __try del hook.
     native::tick();
 
     if (g_visible) ClipCursor(nullptr);
@@ -433,27 +443,23 @@ HRESULT PrepareAndDraw(IDXGISwapChain* swap) {
         Log("apertura automatica de diagnostico");
     }
 
-    // Si no hay nada que pintar, no se abre frame: menos superficie de fallo.
-    if (!g_visible && !native::ready()) return S_OK;
+    if (!g_visible && !native::ready()) return;
 
+    // El estado se guarda y se restaura SIEMPRE, tambien si salta una excepcion
+    // SEH: con __finally no se pierde ni el render target del juego ni las
+    // referencias, que era lo que se iba acumulando hasta reventar.
     D3DState state{};
-    SaveState(state);
-
-    try {
+    __try {
+        SaveState(state);
         DrawFrame();
-    } catch (const std::exception& e) {
-        LogE("excepcion en el frame: %s", e.what());
-        if (ImGui::GetCurrentContext() && ImGui::GetCurrentContext()->WithinFrameScope)
-            ImGui::EndFrame();
+    } __finally {
+        RestoreState(state);
     }
-
-    RestoreState(state);
-    return S_OK;
 }
 
 HRESULT __stdcall hkResize(IDXGISwapChain* swap, UINT a, UINT b, UINT c, DXGI_FORMAT d, UINT e) {
     if (!o_resize) return E_FAIL;
-    if (g_shuttingDown || !g_ready || swap != g_swap) return o_resize(swap, a, b, c, d, e);
+    if (g_shuttingDown || g_dead || !g_ready || swap != g_swap) return o_resize(swap, a, b, c, d, e);
 
     ReleaseRtv();
     if (ImGui::GetCurrentContext()) ImGui_ImplDX11_InvalidateDeviceObjects();
@@ -475,6 +481,7 @@ void OnDeviceLost(HRESULT hr) {
 HRESULT __stdcall hkPresent(IDXGISwapChain* swap, UINT sync, UINT flags) {
     if (!o_present) return S_OK;
     if (g_shuttingDown || g_inPresent) return o_present(swap, sync, flags);
+    if (g_dead) return o_present(swap, sync, flags);
 
     g_inPresent = true;
 
@@ -482,11 +489,14 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* swap, UINT sync, UINT flags) {
         PrepareAndDraw(swap);
         g_faults = 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        if (++g_faults <= 10 || (g_faults % 200) == 0)
+        ++g_faults;
+        if (g_faults <= 10 || (g_faults % 200) == 0)
             LogE("excepcion dentro de Present (total %d)", g_faults);
+        if (ImGui::GetCurrentContext() && ImGui::GetCurrentContext()->WithinFrameScope)
+            ImGui::EndFrame();
+        if (g_faults >= kFaultLimit) Disarm("fallos seguidos en Present");
     }
 
-    // El juego presenta SIEMPRE, aunque nosotros hayamos fallado.
     const HRESULT hr = o_present(swap, sync, flags);
     g_inPresent = false;
 
@@ -497,6 +507,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* swap, UINT sync, UINT flags) {
 HRESULT __stdcall hkPresent1(IDXGISwapChain1* swap, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* p) {
     if (!o_present1) return S_OK;
     if (g_shuttingDown || g_inPresent) return o_present1(swap, sync, flags, p);
+    if (g_dead) return o_present1(swap, sync, flags, p);
 
     g_inPresent = true;
 
@@ -504,8 +515,12 @@ HRESULT __stdcall hkPresent1(IDXGISwapChain1* swap, UINT sync, UINT flags, const
         PrepareAndDraw(swap);
         g_faults = 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        if (++g_faults <= 10 || (g_faults % 200) == 0)
+        ++g_faults;
+        if (g_faults <= 10 || (g_faults % 200) == 0)
             LogE("excepcion dentro de Present1 (total %d)", g_faults);
+        if (ImGui::GetCurrentContext() && ImGui::GetCurrentContext()->WithinFrameScope)
+            ImGui::EndFrame();
+        if (g_faults >= kFaultLimit) Disarm("fallos seguidos en Present1");
     }
 
     const HRESULT hr = o_present1(swap, sync, flags, p);
@@ -535,8 +550,6 @@ void** GrabVtable() {
     desc.OutputWindow = host;
     desc.SampleDesc.Count = 1;
     desc.Windowed = TRUE;
-    // FLIP_DISCARD: es el modelo que usa FiveM/GTA. Con FLIP el objeto es un
-    // IDXGISwapChain1, asi que el indice 22 (Present1) existe de verdad.
     desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
     ID3D11Device* device = nullptr;
@@ -587,6 +600,7 @@ bool CreateSwapChainHook() {
     if (!okP) { LogE("no se pudo parchear Present"); return false; }
     if (!okR) LogE("no se pudo parchear ResizeBuffers");
 
+    g_dead = false;
     g_armed = true;
     Log("vtable parcheada (Present%s + ResizeBuffers)", okP1 ? " + Present1" : "");
     return true;

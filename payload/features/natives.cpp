@@ -1,6 +1,5 @@
 #include "features/natives.h"
 #include "core/module.h"
-#include "core/scanner.h"
 #include "utils/log.h"
 
 #include <Windows.h>
@@ -9,8 +8,6 @@
 #include <vector>
 
 namespace {
-
-// ---------------------------------------------------------------- hashes
 
 enum : uint64_t {
     H_PLAYER_ID                   = 0x4F8644AF03D0E0D6,
@@ -32,8 +29,6 @@ enum : uint64_t {
 };
 
 constexpr uint64_t kValidate[] = { H_PLAYER_ID, H_PLAYER_PED_ID, H_GET_ENTITY_COORDS };
-
-// ---------------------------------------------------------------- contexto
 
 using Handler_t = void (*)(void*);
 
@@ -60,54 +55,52 @@ bool IsExec(uintptr_t p) {
     return false;
 }
 
-// ---------------------------------------------------------------- cosecha
+// Los handlers NO estan en el ejecutable: FiveM los reescribe a sus propios
+// modulos y a bloques asignados. Hay que recoger las secciones ejecutables de
+// TODOS los modulos, no solo del que contiene la tabla.
+void BuildExec() {
+    g_exec.clear();
+    for (auto& m : modules::All()) {
+        auto* dos = reinterpret_cast<PIMAGE_DOS_HEADER>(m.base);
+        if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) continue;
+        auto* nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(m.base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) continue;
+        auto* sec = IMAGE_FIRST_SECTION(nt);
+        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+            if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+            const uintptr_t lo = m.base + sec->VirtualAddress;
+            g_exec.push_back({ lo, lo + sec->Misc.VirtualSize });
+        }
+    }
+}
 
-// Recorre las secciones escribibles del modulo buscando rachas de punteros a
-// codigo. Un bloque de registro es exactamente eso, y los kEntries qwords que
-// hay JUSTO ANTES son sus hashes. No depende de ningun patron de bytes ni del
-// offset del contador, asi que aguanta cambios de build.
+// En un bloque de registro el hash de la entrada k esta exactamente `entries`
+// posiciones antes de su handler. Asi que por cada puntero a codigo se mira
+// `entries` atras y se empareja. No hace falta alinear bloques ni leer el
+// contador, y un handler que FiveM haya dejado a 0 no rompe la deteccion.
 size_t Harvest(const ModuleInfo& m, size_t entries) {
     auto* dos = reinterpret_cast<PIMAGE_DOS_HEADER>(m.base);
     if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
     auto* nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(m.base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
 
-    std::vector<Range> data;
-    auto* sec = IMAGE_FIRST_SECTION(nt);
-    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
-        const uintptr_t lo = m.base + sec->VirtualAddress;
-        const uintptr_t hi = lo + sec->Misc.VirtualSize;
-        if (sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) {
-            g_exec.push_back({ lo, hi });
-        } else if (sec->Characteristics & IMAGE_SCN_MEM_WRITE) {
-            data.push_back({ lo, hi });
-        }
-    }
-    if (g_exec.empty() || data.empty()) return 0;
-
     size_t pairs = 0;
-    for (const auto& r : data) {
-        const auto* p = reinterpret_cast<const uint64_t*>(r.lo);
-        const size_t n = (r.hi - r.lo) / 8;
-        size_t run = 0;
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD s = 0; s < nt->FileHeader.NumberOfSections; ++s, ++sec) {
+        if (sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) continue;
+        if (!(sec->Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
 
-        for (size_t i = 0; i < n; ++i) {
-            if (IsExec(static_cast<uintptr_t>(p[i]))) { ++run; continue; }
+        const uintptr_t lo = m.base + sec->VirtualAddress;
+        const auto* p = reinterpret_cast<const uint64_t*>(lo);
+        const size_t n = sec->Misc.VirtualSize / 8;
 
-            if (run >= entries) {
-                const size_t firstHandler = i - run;
-                if (firstHandler >= entries) {
-                    const uint64_t* hashes = p + firstHandler - entries;
-                    const uint64_t* fns    = p + firstHandler;
-                    for (size_t k = 0; k < entries; ++k) {
-                        const uint64_t h = hashes[k];
-                        if (h && IsExec(static_cast<uintptr_t>(fns[k])))
-                            g_map[h] = reinterpret_cast<void*>(fns[k]);
-                    }
-                    pairs += entries;
-                }
-            }
-            run = 0;
+        for (size_t i = entries; i < n; ++i) {
+            const uintptr_t fn = static_cast<uintptr_t>(p[i]);
+            if (!IsExec(fn)) continue;
+            const uint64_t h = p[i - entries];
+            if (!h || IsExec(static_cast<uintptr_t>(h))) continue;
+            g_map[h] = reinterpret_cast<void*>(fn);
+            ++pairs;
         }
     }
     return pairs;
@@ -124,17 +117,7 @@ bool Validate() {
     return true;
 }
 
-size_t TryHarvest(const ModuleInfo& m, size_t entries, bool& faulted) {
-    faulted = false;
-    __try {
-        return Harvest(m, entries);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        faulted = true;
-        return 0;
-    }
-}
-
-std::vector<ModuleInfo> Order() {
+std::vector<ModuleInfo> GameModules() {
     std::vector<ModuleInfo> out;
     for (auto& m : modules::All()) {
         std::string l = m.name;
@@ -142,37 +125,53 @@ std::vector<ModuleInfo> Order() {
         if (l.find("gtaprocess") != std::string::npos || l.find("gta5") != std::string::npos)
             out.push_back(m);
     }
+    return out;
+}
+
+std::vector<ModuleInfo> FiveModules() {
+    std::vector<ModuleInfo> out;
     for (auto& m : modules::All()) {
         std::string l = m.name;
         for (auto& c : l) c = (char)::tolower((unsigned char)c);
-        if (l.find("gta-core-five") != std::string::npos) out.push_back(m);
+        if (l.find("gta-core-five") != std::string::npos || l.find("scripting-gta") != std::string::npos)
+            out.push_back(m);
     }
     return out;
 }
 
-bool Resolve() {
-    for (auto& m : Order()) {
-        // El numero de entradas por bloque cambia entre builds: se prueban los
-        // dos y se queda el que valide con hashes conocidos.
-        for (size_t entries : { size_t(7), size_t(8) }) {
-            g_map.clear();
-            g_exec.clear();
-
-            bool faulted = false;
-            const size_t pairs = TryHarvest(m, entries, faulted);
-            if (faulted) LogE("[natives] excepcion cosechando %s", m.name.c_str());
-            if (!pairs) continue;
-
-            Log("[natives] %s: %zu pares con bloques de %zu", m.name.c_str(), pairs, entries);
-            if (Validate()) {
-                Log("[natives] tabla cosechada de %s (bloques de %zu, %zu nativas)",
-                    m.name.c_str(), entries, g_map.size());
-                g_status = "resueltas";
-                return true;
-            }
-            Log("[natives] %s: sin validar con bloques de %zu", m.name.c_str(), entries);
+bool TryHarvest(const std::vector<ModuleInfo>& mods, size_t entries, size_t* total) {
+    *total = 0;
+    for (auto& m : mods) {
+        size_t n = 0;
+        __try { n = Harvest(m, entries); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { LogE("[natives] excepcion cosechando %s", m.name.c_str()); }
+        *total += n;
+        if (!n) continue;
+        Log("[natives] %s: %zu pares con paso %zu", m.name.c_str(), n, entries);
+        if (Validate()) {
+            Log("[natives] tabla cosechada de %s (paso %zu, %zu nativas)",
+                m.name.c_str(), entries, g_map.size());
+            g_status = "resueltas";
+            return true;
         }
     }
+    return false;
+}
+
+bool Resolve() {
+    BuildExec();
+    if (g_exec.empty()) { g_status = "sin rangos ejecutables"; return false; }
+
+    for (size_t entries : { size_t(7), size_t(8) }) {
+        // Primero el ejecutable del juego (donde vive la tabla), luego los
+        // modulos de FiveM por si el bloque se mudo de sitio.
+        g_map.clear();
+        size_t a = 0, b = 0;
+        if (TryHarvest(GameModules(), entries, &a)) return true;
+        if (TryHarvest(FiveModules(), entries, &b)) return true;
+        Log("[natives] paso %zu sin validar (juego %zu, five %zu)", entries, a, b);
+    }
+
     g_status = "tabla de nativas no encontrada";
     return false;
 }
