@@ -49,77 +49,117 @@ struct LuaApi {
     }
 };
 
-struct Sig { const char* name; const char* pattern; void** slot; bool optional; };
-
 LuaApi               g_api;
 std::recursive_mutex g_mutex;
 lua_State*           g_state = nullptr;
 bool                 g_ready = false;
 bool                 g_registered = false;
+void*                g_target = nullptr;
 std::vector<std::pair<std::string, std::string>> g_pending;
 
-std::vector<ModuleInfo> LuaModules() {
-    std::vector<ModuleInfo> out;
+std::string Lower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return (char)::tolower(c); });
+    return s;
+}
+
+// Orden de preferencia: 1) modulos con pinta de runtime scripting (ahi vive
+// Lua cuando el runtime esta en su propia DLL), 2) ejecutable del juego (ahi
+// vive cuando va enlazado estatico), 3) el resto. El nombre solo PRIORIZA:
+// FiveM no exporta la API de Lua, asi que nunca se exige un export.
+std::vector<ModuleInfo> Ordered() {
+    std::vector<ModuleInfo> first, game, rest;
     for (auto& m : modules::All()) {
-        std::string l = m.name;
-        std::transform(l.begin(), l.end(), l.begin(), [](unsigned char c) { return (char)::tolower(c); });
-        if (l.find("lua") != std::string::npos) out.push_back(m);
+        const std::string l = Lower(m.name);
+        if (l.find("lua") != std::string::npos || l.find("scripting") != std::string::npos)
+            first.push_back(m);
+        else if (l.find("gtaprocess") != std::string::npos || l.find("gta5") != std::string::npos)
+            game.push_back(m);
+        else
+            rest.push_back(m);
     }
-    return out;
+    first.insert(first.end(), game.begin(), game.end());
+    first.insert(first.end(), rest.begin(), rest.end());
+    return first;
+}
+
+struct Sig { const char* name; const char* pat; void** slot; };
+
+static const Sig kSigs[] = {
+    { "luaL_loadbufferx", "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 30", (void**)&g_api.loadbufferx },
+    { "lua_pcallk",       "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83 EC 20", (void**)&g_api.pcallk },
+    { "lua_tolstring",    "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 30 48 8B E9", (void**)&g_api.tolstring },
+    { "lua_gettop",       "48 8B 41 10 48 2B 41 08 48 C1 F8 04 C3", (void**)&g_api.gettop },
+    { "lua_settop",       "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B F1 48 8B DA 85 D2 78 12", (void**)&g_api.settop },
+    { "lua_pushstring",   "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B D9 48 85 D2 75", (void**)&g_api.pushstring },
+    { "lua_createtable",  "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B F1 48 8B D9 48 63 FA 48 85 D2 7F", (void**)&g_api.createtable },
+    { "lua_setfield",     "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B D9 48 85 D2 74 1E 48 8B F2", (void**)&g_api.setfield },
+    { "lua_pushcclosure", "48 89 5C 24 08 48 89 74 24 10 48 89 7C 24 18 41 56 48 83 EC 20 48 8B D9 48 8B FA 48 63 F1", (void**)&g_api.pushcclosure },
+    { "lua_pushinteger",  "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B D9 48 8B F2 48 85 D2", (void**)&g_api.pushinteger },
+};
+
+constexpr size_t kSigCount = sizeof(kSigs) / sizeof(kSigs[0]);
+
+// Devuelve la primera coincidencia en seccion ejecutable y registra el RVA de
+// todas cuando hay mas de una, para poder fijar la buena con el log delante.
+uintptr_t PickIn(const ModuleInfo& m, const char* pat, size_t* hits) {
+    *hits = 0;
+    const auto all = scanner::FindAll(m, pat, 32);
+    *hits = all.size();
+    if (all.empty()) return 0;
+
+    if (all.size() > 1) {
+        for (auto a : all)
+            Log("[lua]   candidato %s+0x%llX", m.name.c_str(),
+                static_cast<unsigned long long>(a - m.base));
+    }
+
+    for (auto a : all)
+        if (scanner::InExecutableSection(a)) return scanner::FollowJumps(a);
+    return 0;
+}
+
+size_t Probe(const ModuleInfo& m) {
+    memset(&g_api, 0, sizeof(g_api));
+    size_t found = 0;
+    for (const Sig& s : kSigs) {
+        size_t hits = 0;
+        const uintptr_t at = PickIn(m, s.pat, &hits);
+        if (!at) continue;
+        *s.slot = reinterpret_cast<void*>(at);
+        ++found;
+    }
+    return found;
 }
 
 bool Resolve() {
-    const auto mods = LuaModules();
-    if (mods.empty()) { LogE("[lua] ningun modulo con \"lua\""); return false; }
+    size_t best = 0;
+    ModuleInfo bestMod{};
+    uintptr_t probedBase = 0;
 
-    HMODULE host = nullptr;
-    for (auto& m : mods) {
-        HMODULE h = reinterpret_cast<HMODULE>(m.base);
-        if (h && GetProcAddress(h, "luaL_loadbufferx")) { host = h; break; }
+    for (auto& m : Ordered()) {
+        if (!m.valid()) continue;
+        const size_t score = Probe(m);
+        probedBase = m.base;
+        if (score > best) { best = score; bestMod = m; }
+        if (score == kSigCount) break;
     }
-    if (!host) { LogE("[lua] ningun modulo exporta luaL_loadbufferx"); return false; }
-    Log("[lua] modulo anfitrion %p", reinterpret_cast<void*>(host));
 
-    auto byName = [&](const char* n) { return reinterpret_cast<uintptr_t>(GetProcAddress(host, n)); };
-    auto byPattern = [&](const char* pat) -> uintptr_t {
-        for (auto& m : mods) {
-            if (reinterpret_cast<HMODULE>(m.base) != host) continue;
-            size_t hits = 0;
-            const uintptr_t at = scanner::FindUnique(m, pat, &hits);
-            if (!at) {
-                if (hits > 1) Log("[lua] firma ambigua (%zu): %s", hits, pat);
-                return 0;
-            }
-            return scanner::InExecutableSection(at) ? at : 0;
-        }
-        return 0;
-    };
+    // Si el bucle no acabo en el ganador, g_api tiene las direcciones del
+    // ultimo modulo probado: hay que re-probar el bueno.
+    if (best && bestMod.valid() && probedBase != bestMod.base)
+        Probe(bestMod);
 
-    static const Sig sigs[] = {
-        { "luaL_loadbufferx", "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 30", (void**)&g_api.loadbufferx, false },
-        { "lua_pcallk",       "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83 EC 20", (void**)&g_api.pcallk, false },
-        { "lua_tolstring",    "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 30 48 8B E9", (void**)&g_api.tolstring, false },
-        { "lua_gettop",       "48 8B 41 10 48 2B 41 08 48 C1 F8 04 C3", (void**)&g_api.gettop, false },
-        { "lua_settop",       "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B F1 48 8B DA 85 D2 78 12", (void**)&g_api.settop, false },
-        { "lua_pushstring",   "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B D9 48 85 D2 75", (void**)&g_api.pushstring, true },
-        { "lua_createtable",  "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B F1 48 8B D9 48 63 FA 48 85 D2 7F", (void**)&g_api.createtable, true },
-        { "lua_setfield",     "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B D9 48 85 D2 74 1E 48 8B F2", (void**)&g_api.setfield, true },
-        { "lua_pushcclosure", "48 89 5C 24 08 48 89 74 24 10 48 89 7C 24 18 41 56 48 83 EC 20 48 8B D9 48 8B FA 48 63 F1", (void**)&g_api.pushcclosure, true },
-        { "lua_pushinteger",  "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B D9 48 8B F2 48 85 D2", (void**)&g_api.pushinteger, true },
-    };
-
-    for (auto& sig : sigs) {
-        uintptr_t hit = byName(sig.name);
-        if (!hit) hit = byPattern(sig.pattern);
-        if (!hit) {
-            if (sig.optional) Log("firma opcional ausente: %s", sig.name);
-            else LogE("firma no encontrada: %s", sig.name);
-            continue;
-        }
-        *sig.slot = reinterpret_cast<void*>(hit);
-        Log("[lua] %s en %p", sig.name, reinterpret_cast<void*>(hit));
+    if (!g_api.ok()) {
+        LogE("[lua] mejores firmas %zu/%zu en %s", best, kSigCount,
+             bestMod.valid() ? bestMod.name.c_str() : "(ninguno)");
+        return false;
     }
-    return g_api.ok();
+
+    g_target = reinterpret_cast<void*>(g_api.loadbufferx);
+    Log("[lua] anfitrion %s, loadbufferx %p (%zu/%zu firmas)", bestMod.name.c_str(),
+        g_target, best, kSigCount);
+    return true;
 }
 
 int api_log(lua_State* L) {
@@ -129,7 +169,7 @@ int api_log(lua_State* L) {
     return 0;
 }
 
-int api_version(lua_State* L) { g_api.pushstring(L, "fivem-cheat 1.1"); return 1; }
+int api_version(lua_State* L) { g_api.pushstring(L, "fivem-cheat 1.2"); return 1; }
 int api_mouse1(lua_State* L) { g_api.pushinteger(L, GetAsyncKeyState(0x01) & 0x8000 ? 1 : 0); return 1; }
 
 void RegisterInternal(lua_State* L) {
@@ -181,10 +221,17 @@ void shutdown() {
     g_state = nullptr;
     g_ready = false;
     g_registered = false;
+    g_target = nullptr;
 }
 
 bool ready() { return g_ready && g_state != nullptr; }
 lua_State* state() { return g_state; }
+void* target() { return g_target; }
+
+int probeTop(lua_State* L) {
+    if (!L || !g_api.gettop) return 0;
+    return g_api.gettop(L);
+}
 
 void AddField(lua_State* L, const char* name, int (*fn)(lua_State*)) {
     if (!L || !fn || !g_api.canRegister()) return;
@@ -220,12 +267,16 @@ void OnLoadBuffer(lua_State* L) {
         g_state = L;
         if (!g_registered) { g_registered = true; first = true; }
     }
-    if (!first) return;
 
-    Log("estado Lua capturado (%p)", L);
-    RegisterApi(L);
-    CallOnLuaStateSafe(L);
-    FlushPending();
+    if (first) {
+        Log("estado Lua capturado (%p)", L);
+        RegisterApi(L);
+        CallOnLuaStateSafe(L);
+    }
+
+    // Aqui SI estamos en el hilo del juego: es el unico sitio donde se puede
+    // ejecutar Lua sin corromper la pila del runtime.
+    if (PendingCount()) FlushPending();
 }
 
 bool RunString(const std::string& code, const std::string& chunkName) {

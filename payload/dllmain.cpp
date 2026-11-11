@@ -43,11 +43,12 @@ static void BootMark(const char* text) {
     CloseHandle(h);
 }
 
+// Devuelve lo que devuelva el paso, no "si no hubo excepcion": antes cualquier
+// Stage era true y el llamante no podia distinguir un fallo.
 template <typename F>
 static bool Stage(const char* name, F&& fn) {
     try {
-        fn();
-        return true;
+        return fn();
     } catch (const std::exception& e) {
         const std::string line = std::string(name) + " EXC: " + e.what();
         BootMark(line.c_str());
@@ -188,8 +189,10 @@ static DWORD WINAPI LuaThread(LPVOID) {
     if (!ok) { BootMark("lua fallo"); return 0; }
 
     BootMark("lua ok");
-    Stage("hooks", [] { hooks::init(); });
-    if (config::Get().loadOnStart) Stage("scripts", [] { scripts::load_all(); });
+    if (!Stage("hooks", [] { return hooks::init(); })) return 0;
+
+    Sleep(500);
+    if (config::Get().loadOnStart) Stage("scripts", [] { scripts::load_all(); return true; });
     return 0;
 }
 
@@ -207,14 +210,20 @@ static DWORD WINAPI Init(LPVOID) {
         reinterpret_cast<void*>(g_base), g_size);
     Log(SelfImportsRuntime() ? "[core] CRT DINAMICA (mal)" : "[core] CRT estatica, correcto");
 
-    Stage("config", [] { config::Load(); });
+    Stage("config", [] { config::Load(); return true; });
 
     bool mhook = false;
     Stage("minhook", [&] {
         MH_STATUS st = MH_ERROR_MEMORY_ALLOC;
-        for (int i = 0; i < 5 && st != MH_OK; ++i) { st = MH_Initialize(); if (st != MH_OK) Sleep(200); }
-        mhook = st == MH_OK;
+        for (int i = 0; i < 5 && st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED; ++i) {
+            st = MH_Initialize();
+            if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) Sleep(200);
+        }
+        // Ya inicializado tambien vale: antes esto dejaba mhook en false y el
+        // hilo de Lua no se lanzaba nunca.
+        mhook = (st == MH_OK || st == MH_ERROR_ALREADY_INITIALIZED);
         Log(mhook ? "[core] MinHook listo" : "[core] MinHook no disponible");
+        return mhook;
     });
 
     bool window = false;
@@ -224,22 +233,25 @@ static DWORD WINAPI Init(LPVOID) {
             if (!window) Sleep(250);
         }
         BootMark(window ? "ventana encontrada" : "sin ventana en 120s");
+        return window;
     });
 
     if (!window) BootMark("sin ventana, el overlay no se puede armar");
 
     // Overlay PRIMERO: Insert tiene que responder aunque los natives no esten.
-    // Stage devuelve si no hubo excepcion, no lo que devolvio overlay::init():
-    // el resultado se captura dentro del lambda.
-    Sleep(700);
-    bool armed = false;
-    for (int i = 0; i < 40 && !armed; ++i) {
-        Stage("overlay", [&] { armed = overlay::init(); });
-        if (!armed) Sleep(500);
+    if (config::Get().overlayEnabled) {
+        Sleep(700);
+        bool armed = false;
+        for (int i = 0; i < 40 && !armed; ++i) {
+            Stage("overlay", [&] { armed = overlay::init(); return armed; });
+            if (!armed) Sleep(500);
+        }
+        BootMark(armed ? "overlay armado" : "overlay fallo");
+    } else {
+        BootMark("overlay desactivado en config");
     }
-    BootMark(armed ? "overlay armado" : "overlay fallo");
 
-    if (window) Stage("native_scan", [] { native::init(); });
+    if (window) Stage("native_scan", [] { native::init(); return true; });
     if (mhook)  CloseHandle(CreateThread(nullptr, 0, LuaThread, nullptr, 0, nullptr));
 
     BootMark("listo");

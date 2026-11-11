@@ -22,7 +22,7 @@ std::atomic<float> g_fov{ 90.0f };
 std::atomic<float> g_smooth{ 0.55f };
 
 std::atomic<bool> g_installed{ false };
-std::atomic<bool> g_tried{ false };
+std::atomic<bool> g_queued{ false };
 const char* g_status = "esperando runtime Lua";
 
 // ---------------------------------------------------------------- snapshot
@@ -83,6 +83,13 @@ int api_publish(lua_State* L) {
     g_buf[next][n] = '\0';
     g_slot.store(next, std::memory_order_release);
     g_fresh.store(true, std::memory_order_release);
+
+    // Que el script publique es la senal real de que esta vivo: no hace falta
+    // que nadie marque "instalado" desde otro hilo.
+    if (!g_installed.exchange(true)) {
+        g_status = "activo";
+        Log("[native] script de snapshot activo");
+    }
     return 0;
 }
 
@@ -218,18 +225,14 @@ Citizen.CreateThread(function()
 end)
 )LUA";
 
+// Nunca se ejecuta Lua desde aqui: se encola y lo vacia el hook, que corre en
+// el hilo del juego. Ejecutar RunString desde el hilo del render es carrera con
+// el runtime y acaba en crash.
 void Install() {
-    if (g_installed) return;
-    if (!lua::ready()) return;
-
-    if (lua::RunString(kScript, "@cheat_snap")) {
-        g_installed = true;
-        g_status = "activo";
-        Log("[native] script de snapshot instalado");
-    } else {
-        g_status = "error al instalar el script";
-        LogE("[native] no se pudo instalar el script");
-    }
+    if (g_installed || !lua::ready()) return;
+    if (g_queued.exchange(true)) return;
+    lua::PushPending("@cheat_snap", kScript);
+    g_status = "script en cola";
 }
 
 // ---------------------------------------------------------------- parser
@@ -356,22 +359,25 @@ void setSmooth(float v) { g_smooth = v; }
 
 void rearm() {
     g_installed = false;
+    g_queued = false;
+    g_fresh = false;
     g_status = "rearme manual";
     Log("rearme del script solicitado");
+    Install();
 }
 
 bool init() {
-    if (g_tried.exchange(true)) return g_installed.load();
-    if (!lua::init()) {
+    if (!lua::ready()) {
         g_status = "runtime Lua no disponible";
-        g_tried = false;
         return false;
     }
+    Install();
     return g_installed.load();
 }
 
 void shutdown() {
     g_installed = false;
+    g_queued = false;
     g_fresh = false;
 }
 
@@ -385,22 +391,20 @@ void onLuaState(lua_State*) {
 }
 
 void tick() {
-    if (!g_installed) {
-        if (lua::ready()) Install();
+    if (!lua::ready()) {
+        if (g_installed.exchange(false)) g_status = "runtime Lua perdido";
         return;
     }
-    if (!lua::ready()) {
-        g_installed = false;
-        g_status = "runtime Lua perdido";
-    }
+    if (!g_installed) Install();
 }
 
 void render() {
     if (!ready()) return;
     if (!ImGui::GetCurrentContext()) return;
-    if (!g_esp && !g_box && !g_skel) return;
+    // El frame se consume siempre: si se sale antes sin parsear, al reactivar el
+    // ESP se pinta un frame viejo con coordenadas de hace rato.
     if (!ParseFrame()) return;
-    Draw();
+    if (g_esp || g_box || g_skel) Draw();
 }
 
 void renderMenu() {

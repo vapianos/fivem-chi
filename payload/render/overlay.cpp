@@ -28,10 +28,12 @@ using ResizeBuf_t  = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI
 
 // Indices reales de IDXGISwapChain / IDXGISwapChain1:
 //   IDXGIObject 0-6, IDXGIDeviceSubObject 7, Present 8, ResizeBuffers 13,
-//   Present1 18, GetCoreWindow 22. El 22 NO es Present1.
+//   IDXGISwapChain1: GetDesc1 18, GetFullscreenDesc 19, GetHwnd 20,
+//   GetCoreWindow 21, Present1 22.
+// El 18 NO es Present1: escribir ahi rompe GetDesc1 y deja Present1 sin hookear.
 constexpr size_t kIdxPresent  = 8;
 constexpr size_t kIdxResize   = 13;
-constexpr size_t kIdxPresent1 = 18;
+constexpr size_t kIdxPresent1 = 22;
 
 Present_t   o_present  = nullptr;
 Present1_t  o_present1 = nullptr;
@@ -43,6 +45,7 @@ ID3D11Device*           g_device  = nullptr;
 ID3D11DeviceContext*    g_context = nullptr;
 ID3D11RenderTargetView* g_rtv     = nullptr;
 HWND                    g_hwnd    = nullptr;
+IDXGISwapChain*         g_swap    = nullptr;   // swapchain al que pertenece todo lo de arriba
 
 std::atomic<bool> g_visible{ false };
 std::atomic<bool> g_toggleReq{ false };
@@ -123,18 +126,21 @@ void SaveState(D3DState& s) {
 }
 
 void RestoreState(D3DState& s) {
-    if (!g_context) return;
-    g_context->OMSetRenderTargets(1, &s.rtv, s.dsv);
-    if (s.viewports) g_context->RSSetViewports(s.viewports, &s.vp);
-    g_context->RSSetState(s.rs);
-    g_context->OMSetBlendState(s.bs, s.blend, s.mask);
-    g_context->OMSetDepthStencilState(s.ds, s.stencil);
-    g_context->PSSetShader(s.ps, nullptr, 0);
-    g_context->VSSetShader(s.vs, nullptr, 0);
-    g_context->IASetInputLayout(s.il);
-    g_context->IASetPrimitiveTopology(s.topo);
-    g_context->IASetIndexBuffer(s.ib, s.ibFmt, s.ibOff);
-    g_context->IASetVertexBuffers(0, 1, &s.vb, &s.vbStride, &s.vbOff);
+    // Los enlaces se restauran solo si hay contexto; las referencias se sueltan
+    // siempre para no filtrar si el contexto desaparecio a media faena.
+    if (g_context) {
+        g_context->OMSetRenderTargets(1, &s.rtv, s.dsv);
+        if (s.viewports) g_context->RSSetViewports(s.viewports, &s.vp);
+        g_context->RSSetState(s.rs);
+        g_context->OMSetBlendState(s.bs, s.blend, s.mask);
+        g_context->OMSetDepthStencilState(s.ds, s.stencil);
+        g_context->PSSetShader(s.ps, nullptr, 0);
+        g_context->VSSetShader(s.vs, nullptr, 0);
+        g_context->IASetInputLayout(s.il);
+        g_context->IASetPrimitiveTopology(s.topo);
+        g_context->IASetIndexBuffer(s.ib, s.ibFmt, s.ibOff);
+        g_context->IASetVertexBuffers(0, 1, &s.vb, &s.vbStride, &s.vbOff);
+    }
 
     if (s.rtv) s.rtv->Release();
     if (s.dsv) s.dsv->Release();
@@ -238,24 +244,29 @@ void PollKeys() {
     }
 }
 
+// Corre en el hilo propietario de grcWindow, o sea el principal del juego: si
+// algo peta aqui, FiveM lo ve como salida temprana. Nada sin guardar.
 LRESULT CALLBACK hkWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (!o_wndproc) return DefWindowProcW(hwnd, msg, wp, lp);
+    if (!g_visible) return CallWindowProcW(o_wndproc, hwnd, msg, wp, lp);
 
-    if (g_visible) {
+    __try {
         Enqueue(msg, wp, lp);
-        switch (msg) {
-        case WM_KEYDOWN: case WM_KEYUP:
-        case WM_CHAR: case WM_MOUSEMOVE:
-        case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
-        case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
-        case WM_MBUTTONDOWN: case WM_MBUTTONUP:
-        case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
-            return 0;
-        default:
-            break;
-        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogE("excepcion encolando mensaje 0x%04X", msg);
     }
-    return CallWindowProcW(o_wndproc, hwnd, msg, wp, lp);
+
+    switch (msg) {
+    case WM_KEYDOWN: case WM_KEYUP: case WM_CHAR:
+    case WM_MOUSEMOVE:
+    case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
+    case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
+    case WM_MBUTTONDOWN: case WM_MBUTTONUP:
+    case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
+        return 0;
+    default:
+        return CallWindowProcW(o_wndproc, hwnd, msg, wp, lp);
+    }
 }
 
 bool Setup(IDXGISwapChain* swap) {
@@ -274,7 +285,15 @@ bool Setup(IDXGISwapChain* swap) {
 
     g_device = dev;
     g_device->GetImmediateContext(&g_context);
+    if (!g_context) {
+        LogE("sin contexto inmediato, overlay no dibuja");
+        g_device->Release();
+        g_device = nullptr;
+        return false;
+    }
+
     g_hwnd = desc.OutputWindow;
+    g_swap = swap;
 
     if (!CreateRtv(swap)) {
         LogE("sin render target, overlay no dibuja");
@@ -295,18 +314,26 @@ bool Setup(IDXGISwapChain* swap) {
         ReleaseRtv();
         if (g_context) { g_context->Release(); g_context = nullptr; }
         if (g_device) { g_device->Release(); g_device = nullptr; }
+        g_hwnd = nullptr;
+        g_swap = nullptr;
         return false;
     }
 
-    const LONG_PTR prev = SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(hkWndProc));
-    if (prev) {
-        o_wndproc = reinterpret_cast<WNDPROC>(prev);
+    if (config::Get().hookWndProc) {
+        const LONG_PTR prev = SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(hkWndProc));
+        if (prev) {
+            o_wndproc = reinterpret_cast<WNDPROC>(prev);
+        } else {
+            o_wndproc = nullptr;
+            LogE("SetWindowLongPtrW fallo (%lu): se sigue sin WndProc", GetLastError());
+        }
     } else {
-        o_wndproc = nullptr;
-        LogE("SetWindowLongPtrW fallo (%lu): se sigue sin WndProc", GetLastError());
+        Log("WndProc sin enganchar (wndproc=0)");
     }
 
-    g_autoShowAt = GetTickCount64() + 1500;
+    if (config::Get().autoOpen) g_autoShowAt = GetTickCount64() + 1500;
+    else                        g_autoShowAt = 0;
+
     g_nextSetupAt = 0;
     g_faults = 0;
     g_ready = true;
@@ -324,10 +351,14 @@ void DropDevice() {
     ReleaseRtv();
     if (g_context) { g_context->Release(); g_context = nullptr; }
     if (g_device) { g_device->Release(); g_device = nullptr; }
+    g_hwnd = nullptr;
+    g_swap = nullptr;
     g_ready = false;
 }
 
 void DrawFrame() {
+    if (!g_context) return;
+
     Msg m;
     while (Dequeue(m)) {
         if (ImGui::GetCurrentContext())
@@ -354,9 +385,7 @@ void DrawFrame() {
 HRESULT __stdcall hkPresent(IDXGISwapChain* swap, UINT sync, UINT flags);
 HRESULT __stdcall hkPresent1(IDXGISwapChain1* swap, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* p);
 
-HRESULT PrepareAndDraw(IDXGISwapChain* swap, bool& drew) {
-    drew = false;
-
+HRESULT PrepareAndDraw(IDXGISwapChain* swap) {
     if (!g_ready) {
         const ULONGLONG now = GetTickCount64();
         if (now < g_nextSetupAt) return S_OK;
@@ -365,6 +394,11 @@ HRESULT PrepareAndDraw(IDXGISwapChain* swap, bool& drew) {
             return S_OK;
         }
     }
+
+    // Otro swapchain que no es el nuestro: no se le toca el render target,
+    // porque g_rtv pertenece al backbuffer del swapchain de grcWindow.
+    if (swap != g_swap) return S_OK;
+
     if (!g_rtv && !CreateRtv(swap)) return S_OK;
 
     if (!g_loggedFirst) { g_loggedFirst = true; Log("primer Present recibido"); }
@@ -381,15 +415,16 @@ HRESULT PrepareAndDraw(IDXGISwapChain* swap, bool& drew) {
             if (g_vtable[kIdxPresent1]) o_present1 = reinterpret_cast<Present1_t>(g_vtable[kIdxPresent1]);
             PatchSlot(g_vtable, kIdxPresent1, reinterpret_cast<void*>(&hkPresent1), nullptr);
         }
-        if (g_hwnd && o_wndproc &&
+        if (config::Get().hookWndProc && g_hwnd && o_wndproc &&
             GetWindowLongPtrW(g_hwnd, GWLP_WNDPROC) != reinterpret_cast<LONG_PTR>(hkWndProc))
             SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(hkWndProc));
     }
 
     PollKeys();
-
-    // Siempre: tick avanza la validacion de natives un paso por frame.
     native::tick();
+
+    // GTA re-recorta el cursor en su propio update: hay que reafirmarlo.
+    if (g_visible) ClipCursor(nullptr);
 
     if (!g_visible && g_autoShowAt && GetTickCount64() > g_autoShowAt) {
         g_autoShowAt = 0;
@@ -397,12 +432,14 @@ HRESULT PrepareAndDraw(IDXGISwapChain* swap, bool& drew) {
         Log("apertura automatica de diagnostico");
     }
 
+    // Si no hay nada que pintar, no se abre frame: menos superficie de fallo.
+    if (!g_visible && !native::ready()) return S_OK;
+
     D3DState state{};
     SaveState(state);
 
     try {
         DrawFrame();
-        drew = true;
     } catch (const std::exception& e) {
         LogE("excepcion en el frame: %s", e.what());
         if (ImGui::GetCurrentContext() && ImGui::GetCurrentContext()->WithinFrameScope)
@@ -415,7 +452,7 @@ HRESULT PrepareAndDraw(IDXGISwapChain* swap, bool& drew) {
 
 HRESULT __stdcall hkResize(IDXGISwapChain* swap, UINT a, UINT b, UINT c, DXGI_FORMAT d, UINT e) {
     if (!o_resize) return E_FAIL;
-    if (g_shuttingDown || !g_ready) return o_resize(swap, a, b, c, d, e);
+    if (g_shuttingDown || !g_ready || swap != g_swap) return o_resize(swap, a, b, c, d, e);
 
     ReleaseRtv();
     if (ImGui::GetCurrentContext()) ImGui_ImplDX11_InvalidateDeviceObjects();
@@ -439,20 +476,17 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* swap, UINT sync, UINT flags) {
     if (g_shuttingDown || g_inPresent) return o_present(swap, sync, flags);
 
     g_inPresent = true;
-    bool drew = false;
-    HRESULT hr = S_OK;
 
     __try {
-        hr = PrepareAndDraw(swap, drew);
+        PrepareAndDraw(swap);
         g_faults = 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        ++g_faults;
-        if (g_faults <= 10 || (g_faults % 200) == 0)
+        if (++g_faults <= 10 || (g_faults % 200) == 0)
             LogE("excepcion dentro de Present (total %d)", g_faults);
     }
 
-    if (!drew || hr == S_OK) hr = o_present(swap, sync, flags);
-
+    // El juego presenta SIEMPRE, aunque nosotros hayamos fallado.
+    const HRESULT hr = o_present(swap, sync, flags);
     g_inPresent = false;
 
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) OnDeviceLost(hr);
@@ -464,20 +498,16 @@ HRESULT __stdcall hkPresent1(IDXGISwapChain1* swap, UINT sync, UINT flags, const
     if (g_shuttingDown || g_inPresent) return o_present1(swap, sync, flags, p);
 
     g_inPresent = true;
-    bool drew = false;
-    HRESULT hr = S_OK;
 
     __try {
-        hr = PrepareAndDraw(swap, drew);
+        PrepareAndDraw(swap);
         g_faults = 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        ++g_faults;
-        if (g_faults <= 10 || (g_faults % 200) == 0)
+        if (++g_faults <= 10 || (g_faults % 200) == 0)
             LogE("excepcion dentro de Present1 (total %d)", g_faults);
     }
 
-    if (!drew || hr == S_OK) hr = o_present1(swap, sync, flags, p);
-
+    const HRESULT hr = o_present1(swap, sync, flags, p);
     g_inPresent = false;
 
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) OnDeviceLost(hr);
@@ -505,7 +535,7 @@ void** GrabVtable() {
     desc.SampleDesc.Count = 1;
     desc.Windowed = TRUE;
     // FLIP_DISCARD: es el modelo que usa FiveM/GTA. Con FLIP el objeto es un
-    // IDXGISwapChain1, asi que el indice 18 (Present1) existe de verdad.
+    // IDXGISwapChain1, asi que el indice 22 (Present1) existe de verdad.
     desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
     ID3D11Device* device = nullptr;

@@ -34,6 +34,8 @@ void Apply(const char* key, size_t keyLen, const char* val, size_t valLen) {
     else if (Same(key, keyLen, "overlay"))        g_config.overlayEnabled = n != 0;
     else if (Same(key, keyLen, "debug_console"))  g_config.debugConsole = n != 0;
     else if (Same(key, keyLen, "log_level"))      g_config.logLevel = (int)n;
+    else if (Same(key, keyLen, "auto_open"))      g_config.autoOpen = n != 0;
+    else if (Same(key, keyLen, "wndproc"))        g_config.hookWndProc = n != 0;
 }
 
 // Se llama siempre con el lock tomado: nunca reentra en Save().
@@ -56,12 +58,16 @@ void SaveLocked() {
         "load_on_start=%d\r\n"
         "overlay=%d\r\n"
         "debug_console=%d\r\n"
-        "log_level=%d\r\n",
+        "log_level=%d\r\n"
+        "auto_open=%d\r\n"
+        "wndproc=%d\r\n",
         g_config.menuKey,
         g_config.loadOnStart ? 1 : 0,
         g_config.overlayEnabled ? 1 : 0,
         g_config.debugConsole ? 1 : 0,
-        g_config.logLevel);
+        g_config.logLevel,
+        g_config.autoOpen ? 1 : 0,
+        g_config.hookWndProc ? 1 : 0);
 
     DWORD put = 0;
     WriteFile(h, buf, (DWORD)n, &put, nullptr);

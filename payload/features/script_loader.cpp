@@ -45,16 +45,13 @@ void load_all() {
         ss << in.rdbuf();
         const std::string name = file.filename().string();
 
-        // Con estado capturado estamos en el hilo del juego solo si venimos del
-        // hook; fuera de el se encola y FlushPending lo ejecuta alli.
+        // Solo se encola. La ejecucion la hace el hook de luaL_loadbufferx, que
+        // es el unico punto que corre en el hilo del juego: aqui (menu, boton)
+        // se esta en el hilo del render.
         lua::PushPending(name, ss.str());
     }
 
     Log("%zu scripts encolados desde %s", files.size(), paths::ToUtf8(dir).c_str());
-
-    // Si ya hay estado y no estamos en el hilo Lua, RunString se usa solo para
-    // los que quedan pendientes desde la siguiente carga de chunk. Forzamos un
-    // intento inmediato: si falla, quedan en cola.
-    if (lua::ready()) lua::FlushPending();
+    if (!lua::ready()) Log("el runtime Lua aun no esta: se ejecutaran al capturar el estado");
 }
 } // namespace scripts
