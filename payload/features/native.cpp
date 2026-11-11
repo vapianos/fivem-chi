@@ -1,5 +1,6 @@
 #include "features/native.h"
 #include "features/natives.h"
+#include "core/config.h"
 #include "utils/log.h"
 
 #include <Windows.h>
@@ -58,7 +59,7 @@ bool GetCoords(int64_t ent, Vec3& out) {
 
 bool W2S(const Vec3& p, float sw, float sh, float& sx, float& sy) {
     // GET_SCREEN_COORD_FROM_WORLD_COORD(x, y, z, &sx, &sy) -> BOOL
-    alignas(16) uint8_t ret[16]{};
+    alignas(16) uint8_t ret[64]{};
     float ox = 0.0f, oy = 0.0f;
     uint64_t args[5] = { 0, 0, 0, 0, 0 };
     memcpy(&args[0], &p.x, 4);
@@ -80,12 +81,12 @@ bool W2S(const Vec3& p, float sw, float sh, float& sx, float& sy) {
 void ScreenRes(float& sw, float& sh) {
     sw = 1920.0f;
     sh = 1080.0f;
-    if (!natives::has(0x2E397A4B1C4B6F4F)) return;
+    if (!natives::has(0x873C9F3104101DD3)) return;
 
-    alignas(16) uint8_t ret[16]{};
+    alignas(16) uint8_t ret[64]{};
     int x = 0, y = 0;
     uint64_t args[2] = { reinterpret_cast<uint64_t>(&x), reinterpret_cast<uint64_t>(&y) };
-    if (!natives::call(0x2E397A4B1C4B6F4F, ret, 2, args)) return;
+    if (!natives::call(0x873C9F3104101DD3, ret, 2, args)) return;
     if (x > 0 && y > 0) { sw = static_cast<float>(x); sh = static_cast<float>(y); }
 }
 
@@ -131,7 +132,7 @@ void DoJump() {
 }
 
 void DoAim(const Vec3& self, float sw, float sh) {
-    if (!natives::has(0x14D6F5678D8F1B37) || !natives::has(0xC2AB6BF4E8A9C5F7)) return;
+    if (!natives::has(0x14D6F5678D8F1B37) || !natives::has(0xB4EC2312F4E5B1F1)) return;
 
     const float fovPx = g_fov;
     const float cx = sw * 0.5f, cy = sh * 0.5f;
@@ -177,14 +178,14 @@ void DoAim(const Vec3& self, float sw, float sh) {
     uint64_t ah[1] = { 0 };
     float bh = bearing;
     memcpy(&ah[0], &bh, 4);
-    natives::v_void(0xC2AB6BF4E8A9C5F7, 1, ah);
+    natives::v_void(0xB4EC2312F4E5B1F1, 1, ah);
 
-    if (natives::has(0x2F5C4B1C1C7E1A28)) {
+    if (natives::has(0x6D0858B8EDFD2B7D)) {
         uint64_t ap[2] = { 0, 0 };
         float bp = pitch, one = 1.0f;
         memcpy(&ap[0], &bp, 4);
         memcpy(&ap[1], &one, 4);
-        natives::v_void(0x2F5C4B1C1C7E1A28, 2, ap);
+        natives::v_void(0x6D0858B8EDFD2B7D, 2, ap);
     }
 }
 
@@ -217,7 +218,7 @@ void BuildEsp(const Vec3& self, float sw, float sh) {
 
         Vec3 hc{};
         float hx = fx, hy = fy - 40.0f;
-        if (BoneCoords(oped, 0, hc) && W2S(hc, sw, sh, hx, hy)) { /* ok */ }
+        if (BoneCoords(oped, 31086, hc) && W2S(hc, sw, sh, hx, hy)) { /* ok */ }
 
         const int idx = g_frame.count;
         if (idx >= 32) break;
@@ -231,7 +232,13 @@ void BuildEsp(const Vec3& self, float sw, float sh) {
         PlayerName(i, g_frame.name[idx], sizeof(g_frame.name[idx]));
 
         if (wantSkel && dist <= 300.0f) {
-            static const int kBones[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 };
+            static const int kBones[] = {
+                31086, 39317, 24818, 11816,
+                45509, 61163, 18905,
+                40269, 28252, 57005,
+                58271, 63931, 14201,
+                51826, 36864, 52301
+            };
             for (int b : kBones) {
                 Vec3 bc{};
                 if (!BoneCoords(oped, b, bc)) continue;
@@ -246,9 +253,23 @@ void BuildEsp(const Vec3& self, float sw, float sh) {
     }
 }
 
+const BonePt* FindBone(int idx, int id) {
+    for (int k = 0; k < g_frame.boneCount[idx]; ++k)
+        if (g_frame.bones[idx][k].id == id) return &g_frame.bones[idx][k];
+    return nullptr;
+}
+
 void Draw() {
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
     if (!dl) return;
+
+    static const int kLinks[][2] = {
+        { 31086, 39317 }, { 39317, 24818 }, { 24818, 11816 },
+        { 39317, 45509 }, { 45509, 61163 }, { 61163, 18905 },
+        { 39317, 40269 }, { 40269, 28252 }, { 28252, 57005 },
+        { 11816, 58271 }, { 58271, 63931 }, { 63931, 14201 },
+        { 11816, 51826 }, { 51826, 36864 }, { 36864, 52301 },
+    };
 
     for (int i = 0; i < g_frame.count; ++i) {
         const float x0 = g_frame.box[i][0], y0 = g_frame.box[i][1];
@@ -264,10 +285,11 @@ void Draw() {
                         IM_COL32(0, 255, 128, 200), 0.0f, 0, 1.5f);
 
         if (g_skel && g_frame.boneCount[i] > 1) {
-            for (int k = 1; k < g_frame.boneCount[i]; ++k) {
-                const BonePt& a = g_frame.bones[i][k - 1];
-                const BonePt& b = g_frame.bones[i][k];
-                dl->AddLine(ImVec2(a.x, a.y), ImVec2(b.x, b.y), IM_COL32(255, 255, 255, 190), 1.2f);
+            for (const auto& link : kLinks) {
+                const BonePt* a = FindBone(i, link[0]);
+                const BonePt* b = FindBone(i, link[1]);
+                if (a && b)
+                    dl->AddLine(ImVec2(a->x, a->y), ImVec2(b->x, b->y), IM_COL32(255, 255, 255, 190), 1.2f);
             }
         }
 
@@ -325,9 +347,22 @@ bool init() {
 void shutdown() { g_up = false; }
 
 void tick() {
-    if (!ready()) return;
-
     const ULONGLONG now = GetTickCount64();
+    if (!ready()) {
+        static ULONGLONG s_lastRetry = 0;
+        if (config::Get().nativesEnabled && now - s_lastRetry >= 2000) {
+            s_lastRetry = now;
+            if (natives::init()) {
+                g_up = true;
+                g_status = "activo";
+                Log("[native] nativas listas");
+            } else {
+                g_status = natives::statusText();
+            }
+        }
+        return;
+    }
+
     if (now - g_lastTick < 4) return;   // ~250 Hz max, no saturar el Present
     g_lastTick = now;
 

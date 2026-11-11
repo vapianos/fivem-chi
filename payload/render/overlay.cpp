@@ -64,8 +64,9 @@ ULONGLONG         g_autoShowAt   = 0;
 ULONGLONG         g_nextSetupAt  = 0;
 int               g_faults       = 0;
 
-RECT g_savedClip{};
-bool g_hadClip = false;
+RECT  g_savedClip{};
+bool  g_hadClip = false;
+POINT g_lastMouse{};
 
 int PrimaryKey() {
     const int k = config::Get().menuKey;
@@ -210,6 +211,7 @@ void ApplyVisible(bool state) {
 
     if (state) {
         g_hadClip = GetClipCursor(&g_savedClip) != 0;
+        GetCursorPos(&g_lastMouse);
         ClipCursor(nullptr);
     } else {
         if (g_hadClip) ClipCursor(&g_savedClip);
@@ -265,6 +267,12 @@ LRESULT CALLBACK hkWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         Enqueue(msg, wp, lp);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         LogE("excepcion encolando mensaje 0x%04X", msg);
+    }
+
+    if (msg == WM_MOUSEMOVE) {
+        POINT p{ static_cast<LONG>(static_cast<short>(LOWORD(lp))),
+                 static_cast<LONG>(static_cast<short>(HIWORD(lp))) };
+        if (ClientToScreen(hwnd, &p)) g_lastMouse = p;
     }
 
     switch (msg) {
@@ -451,7 +459,13 @@ void PrepareAndDraw(IDXGISwapChain* swap) {
     PollKeys();
     native::tick();
 
-    if (g_visible) ClipCursor(nullptr);
+    if (g_visible) {
+        // GTA recentra el cursor cada frame en su update: se le devuelve
+        // nuestra posicion para que el menu sea usable (solo con foco).
+        ClipCursor(nullptr);
+        if (GetForegroundWindow() == g_hwnd)
+            SetCursorPos(g_lastMouse.x, g_lastMouse.y);
+    }
 
     if (!g_visible && g_autoShowAt && GetTickCount64() > g_autoShowAt) {
         g_autoShowAt = 0;

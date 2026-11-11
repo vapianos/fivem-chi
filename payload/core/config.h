@@ -8,7 +8,7 @@ struct Config {
     int  logLevel       = 1;
 
     bool autoOpen       = true;
-    bool hookWndProc    = false;  // apagado por defecto: es el hilo principal
+    bool hookWndProc    = true;   // sin esto el menu no recibe clics
     bool nativesEnabled = true;
 };
 

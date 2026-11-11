@@ -11,8 +11,11 @@
 static HMODULE   g_self     = nullptr;
 static uintptr_t g_base     = 0;
 static size_t    g_size     = 0;
-static volatile LONG g_unloadReq = 0;
-static volatile LONG g_vehCount  = 0;
+static volatile LONG g_unloadReq   = 0;
+static volatile LONG g_vehCount    = 0;
+static volatile LONG g_nativesDone = 0;
+static PVOID g_veh = nullptr;
+static LPTOP_LEVEL_EXCEPTION_FILTER g_oldUef = nullptr;
 
 static void BootMark(const char* text) {
     wchar_t dir[MAX_PATH]{};
@@ -186,20 +189,31 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
 
 static DWORD WINAPI UnloadThread(LPVOID) {
     Sleep(150);
+    // Sin esto, FreeLibrary deja el VEH y el UEF apuntando a codigo desmapeado
+    // y el siguiente 0xC000001D de adhesive salta a memoria muerta.
+    for (int i = 0; i < 300 && !g_nativesDone; ++i) Sleep(10);
+    if (g_veh) { RemoveVectoredExceptionHandler(g_veh); g_veh = nullptr; }
+    if (g_oldUef) { SetUnhandledExceptionFilter(g_oldUef); g_oldUef = nullptr; }
     overlay::shutdown();
     native::shutdown();
     BootMark("descargado");
     Log("[core] descargado");
     LogShutdown();
+    Sleep(300);
     ExitThread(0);
     return 0;
 }
 
 static DWORD WINAPI NativesThread(LPVOID) {
     Sleep(2000);
-    if (!config::Get().nativesEnabled) { BootMark("nativas desactivadas"); return 0; }
+    if (!config::Get().nativesEnabled) {
+        BootMark("nativas desactivadas");
+        InterlockedExchange(&g_nativesDone, 1);
+        return 0;
+    }
     if (Stage("natives", [] { return native::init(); })) BootMark("nativas ok");
     else BootMark("nativas fallo");
+    InterlockedExchange(&g_nativesDone, 1);
     return 0;
 }
 
@@ -211,8 +225,8 @@ static DWORD WINAPI Init(LPVOID) {
     LogInit();
     BootMark("log inicializado");
 
-    AddVectoredExceptionHandler(1, VehFilter);
-    SetUnhandledExceptionFilter(CrashFilter);
+    g_veh = AddVectoredExceptionHandler(1, VehFilter);
+    g_oldUef = SetUnhandledExceptionFilter(CrashFilter);
     CaptureRange();
 
     Log("[core] init pid=%lu base=%p size=0x%zX", GetCurrentProcessId(),
@@ -246,6 +260,7 @@ static DWORD WINAPI Init(LPVOID) {
     }
 
     if (window) CloseHandle(CreateThread(nullptr, 0, NativesThread, nullptr, 0, nullptr));
+    else InterlockedExchange(&g_nativesDone, 1);
 
     BootMark("listo");
     Log("[core] listo");

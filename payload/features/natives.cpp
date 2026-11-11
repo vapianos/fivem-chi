@@ -1,11 +1,11 @@
 #include "features/natives.h"
-#include "core/module.h"
 #include "utils/log.h"
 
 #include <Windows.h>
 #include <cstring>
+#include <string>
 #include <unordered_map>
-#include <vector>
+#include <unordered_set>
 
 namespace {
 
@@ -23,55 +23,92 @@ enum : uint64_t {
     H_SET_ENTITY_INVINCIBLE       = 0x3882114BDE571AD4,
     H_SET_SUPER_JUMP_THIS_FRAME   = 0x57FFF03E423A4C0B,
     H_GET_GAMEPLAY_CAM_COORD      = 0x14D6F5678D8F1B37,
-    H_SET_CAM_RELATIVE_HEADING    = 0xC2AB6BF4E8A9C5F7,
-    H_SET_CAM_RELATIVE_PITCH      = 0x2F5C4B1C1C7E1A28,
-    H_GET_ACTIVE_SCREEN_RES       = 0x2E397A4B1C4B6F4F,
+    H_SET_CAM_RELATIVE_HEADING    = 0xB4EC2312F4E5B1F1,
+    H_SET_CAM_RELATIVE_PITCH      = 0x6D0858B8EDFD2B7D,
+    H_GET_ACTIVE_SCREEN_RES       = 0x873C9F3104101DD3,
 };
 
-constexpr uint64_t kValidate[] = { H_PLAYER_ID, H_PLAYER_PED_ID, H_GET_ENTITY_COORDS };
+using CallNative_t = bool (*)(uint64_t, void*);
 
-using Handler_t = void (*)(void*);
+CallNative_t g_callNative = nullptr;
+int          g_layout     = 0;      // 1..4 segun cual valide
+bool         g_ready      = false;
+const char*  g_status     = "sin resolver";
 
-struct NativeContext {
-    void*    retn      = nullptr;
-    uint32_t argCount  = 0;
-    uint32_t pad0      = 0;
-    void*    args      = nullptr;
-    uint32_t dataCount = 0;
-    uint32_t pad1      = 0;
-    void*    vector    = nullptr;
+std::unordered_set<uint64_t> g_missing;
+
+// Buffer compatible con fx::ScriptContext / ScriptContextRaw / scrNativeCallContext.
+// Soporta hasta 32 argumentos de 64 bits (MaxArguments = 32 en CitizenFX).
+struct CtxBuf {
+    alignas(16) uint8_t args[256]{};
+    alignas(16) uint8_t results[64]{};
+    alignas(16) uint8_t obj[64]{};
 };
 
-std::unordered_map<uint64_t, void*> g_map;   // cache / modo cosechado
-bool        g_ready  = false;
-bool        g_member = false;                // el resolver es miembro (this + hash)
-const char* g_status = "sin resolver";
-
-void* g_getHandler = nullptr;                // modo exportacion
-
-struct Range { uintptr_t lo, hi; };
-std::vector<Range> g_exec;
-
-bool IsExec(uintptr_t p) {
-    for (const auto& r : g_exec)
-        if (p >= r.lo && p < r.hi) return true;
-    return false;
+// Disposiciones probadas en fx::ScriptContext:
+//   1) +0x00 args, +0x08 results, +0x10 nargs, +0x14 nresults (lee results)
+//   2) +0x00 nargs, +0x04 nresults, +0x08 args, +0x10 results (lee results)
+//   3) +0x00 m_argumentBuffer (shared args), +0x08 m_numArguments, +0x0C m_numResults (lee args)
+//   4) +0x00 m_pReturn (results), +0x08 m_nArgCount, +0x10 m_pArgs (args), +0x18 m_nDataCount (lee results)
+void FillCtx(CtxBuf& b, uint32_t nargs, uint32_t nresults) {
+    memset(b.obj, 0, sizeof(b.obj));
+    switch (g_layout) {
+    case 1:
+        *reinterpret_cast<uint8_t**>(b.obj + 0x00) = b.args;
+        *reinterpret_cast<uint8_t**>(b.obj + 0x08) = b.results;
+        *reinterpret_cast<uint32_t*>(b.obj + 0x10) = nargs;
+        *reinterpret_cast<uint32_t*>(b.obj + 0x14) = nresults;
+        break;
+    case 2:
+        *reinterpret_cast<uint32_t*>(b.obj + 0x00) = nargs;
+        *reinterpret_cast<uint32_t*>(b.obj + 0x04) = nresults;
+        *reinterpret_cast<uint8_t**>(b.obj + 0x08) = b.args;
+        *reinterpret_cast<uint8_t**>(b.obj + 0x10) = b.results;
+        break;
+    case 3:
+        *reinterpret_cast<uint8_t**>(b.obj + 0x00) = b.args;
+        *reinterpret_cast<int32_t*>(b.obj + 0x08)  = static_cast<int32_t>(nargs);
+        *reinterpret_cast<int32_t*>(b.obj + 0x0C)  = 0;
+        break;
+    default:
+        *reinterpret_cast<uint8_t**>(b.obj + 0x00) = b.results;
+        *reinterpret_cast<uint32_t*>(b.obj + 0x08) = nargs;
+        *reinterpret_cast<uint8_t**>(b.obj + 0x10) = b.args;
+        *reinterpret_cast<uint32_t*>(b.obj + 0x18) = 0;
+        break;
+    }
 }
 
-void BuildExec() {
-    g_exec.clear();
-    for (auto& m : modules::All()) {
-        auto* dos = reinterpret_cast<PIMAGE_DOS_HEADER>(m.base);
-        if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) continue;
-        auto* nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(m.base + dos->e_lfanew);
-        if (nt->Signature != IMAGE_NT_SIGNATURE) continue;
-        auto* sec = IMAGE_FIRST_SECTION(nt);
-        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
-            if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
-            const uintptr_t lo = m.base + sec->VirtualAddress;
-            g_exec.push_back({ lo, lo + sec->Misc.VirtualSize });
-        }
+bool TryCallNative(uint64_t hash, void* ctxObj, bool& faulted) {
+    faulted = false;
+    __try {
+        return g_callNative(hash, ctxObj);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        faulted = true;
+        return false;
     }
+}
+
+// Llama y devuelve false si el hash no existe o el contexto revienta.
+bool Raw(uint64_t hash, uint8_t* out, uint32_t nargs, const uint64_t* args) {
+    if (!g_callNative || nargs > 32) return false;
+    if (g_ready && g_missing.find(hash) != g_missing.end()) return false;
+
+    CtxBuf b;
+    if (nargs && args) memcpy(b.args, args, static_cast<size_t>(nargs) * 8);
+    FillCtx(b, nargs, 8);
+
+    bool faulted = false;
+    const bool ok = TryCallNative(hash, b.obj, faulted);
+    if (!ok) {
+        if (g_ready && !faulted) g_missing.insert(hash);
+        return false;
+    }
+    if (out) {
+        const uint8_t* src = (g_layout == 3) ? b.args : b.results;
+        memcpy(out, src, 32);
+    }
+    return true;
 }
 
 std::string Lower(std::string s) {
@@ -79,43 +116,7 @@ std::string Lower(std::string s) {
     return s;
 }
 
-// ------------------------------------------------------------------ modo 1
-
-// Pregunta a la funcion de FiveM. Se prueban las dos convenciones: estatica
-// (hash) y miembro (this, hash). La que devuelva algo ejecutable es la buena.
-void* Ask(uint64_t hash) {
-    if (!g_getHandler) return nullptr;
-    void* h = nullptr;
-    __try {
-        if (g_member) {
-            auto fn = reinterpret_cast<void*(*)(void*, uint64_t)>(g_getHandler);
-            h = fn(nullptr, hash);
-        } else {
-            auto fn = reinterpret_cast<void*(*)(uint64_t)>(g_getHandler);
-            h = fn(hash);
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return nullptr;
-    }
-    return IsExec(reinterpret_cast<uintptr_t>(h)) ? h : nullptr;
-}
-
-bool ProbeConvention() {
-    __try {
-        auto one = reinterpret_cast<void*(*)(uint64_t)>(g_getHandler);
-        if (IsExec(reinterpret_cast<uintptr_t>(one(H_PLAYER_ID)))) { g_member = false; return true; }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-
-    __try {
-        auto two = reinterpret_cast<void*(*)(void*, uint64_t)>(g_getHandler);
-        if (IsExec(reinterpret_cast<uintptr_t>(two(nullptr, H_PLAYER_ID)))) { g_member = true; return true; }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-
-    return false;
-}
-
-// Recorre la tabla de exportaciones del modulo buscando el resolver.
-void* ScanExports(HMODULE h, const char* modName) {
+void* FindExport(HMODULE h, const char* modName, const char* want) {
     auto* dos = reinterpret_cast<PIMAGE_DOS_HEADER>(h);
     if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
     auto* nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(reinterpret_cast<uint8_t*>(h) + dos->e_lfanew);
@@ -124,160 +125,71 @@ void* ScanExports(HMODULE h, const char* modName) {
     const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
     if (!dir.Size) return nullptr;
 
-    auto* exp  = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(reinterpret_cast<uint8_t*>(h) + dir.VirtualAddress);
+    auto* exp   = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(reinterpret_cast<uint8_t*>(h) + dir.VirtualAddress);
     auto* names = reinterpret_cast<DWORD*>(reinterpret_cast<uint8_t*>(h) + exp->AddressOfNames);
     auto* ords  = reinterpret_cast<WORD*>(reinterpret_cast<uint8_t*>(h) + exp->AddressOfNameOrdinals);
     auto* fns   = reinterpret_cast<DWORD*>(reinterpret_cast<uint8_t*>(h) + exp->AddressOfFunctions);
 
-    Log("[natives] %s: %lu exportaciones", modName, exp->NumberOfNames);
-
-    void* best = nullptr;
     for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
         const char* n = reinterpret_cast<const char*>(h) + names[i];
-        const std::string l = Lower(n);
-
-        if (l.find("nativehandler") == std::string::npos) continue;
+        if (Lower(n).find(want) == std::string::npos) continue;
 
         const DWORD rva = fns[ords[i]];
-        if (rva >= dir.VirtualAddress && rva < dir.VirtualAddress + dir.Size) continue;  // forwarder
-
-        Log("[natives] candidato %s!%s", modName, n);
-
-        if (l.find("getnativehandler") != std::string::npos) {
-            best = reinterpret_cast<uint8_t*>(h) + rva;
-            break;
-        }
-        if (!best) best = reinterpret_cast<uint8_t*>(h) + rva;
+        if (rva >= dir.VirtualAddress && rva < dir.VirtualAddress + dir.Size) continue;
+        Log("[natives] %s!%s", modName, n);
+        return reinterpret_cast<uint8_t*>(h) + rva;
     }
-    return best;
+    return nullptr;
 }
 
-bool ResolveViaExports() {
-    static const wchar_t* kMods[] = { L"gta-core-five.dll", L"scripting-gta.dll" };
-    for (const wchar_t* w : kMods) {
-        HMODULE h = GetModuleHandleW(w);
-        if (!h) { Log("[natives] %ls no cargado", w); continue; }
+bool TryLayout(int layout) {
+    g_layout = layout;
+    int64_t id = -1;
+    if (!Raw(H_PLAYER_ID, reinterpret_cast<uint8_t*>(&id), 0, nullptr)) return false;
+    if (id < 0 || id > 31) return false;
 
-        char name[64]{};
-        WideCharToMultiByte(CP_UTF8, 0, w, -1, name, sizeof(name) - 1, nullptr, nullptr);
+    int64_t ped = 0;
+    if (!Raw(H_PLAYER_PED_ID, reinterpret_cast<uint8_t*>(&ped), 0, nullptr)) return false;
+    if (ped == 0) return false;
 
-        g_getHandler = ScanExports(h, name);
-        if (!g_getHandler) continue;
-        Log("[natives] resolver en %p", g_getHandler);
-
-        if (ProbeConvention()) {
-            for (uint64_t v : kValidate)
-                if (!Ask(v)) { g_getHandler = nullptr; break; }
-            if (g_getHandler) {
-                g_status = g_member ? "resueltas (export, miembro)" : "resueltas (export)";
-                return true;
-            }
-        }
-        Log("[natives] el resolver de %s no respondio a los hashes conocidos", name);
-        g_getHandler = nullptr;
-    }
-    return false;
-}
-
-// ------------------------------------------------------------------ modo 2
-
-// Respaldo: cosecha de bloques con forma estricta (next, 7 hashes, 7 handlers,
-// contador 1..7). Menos falsos positivos que mirar solo punteros.
-size_t HarvestBlocks(const ModuleInfo& m) {
-    auto* dos = reinterpret_cast<PIMAGE_DOS_HEADER>(m.base);
-    if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
-    auto* nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(m.base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
-
-    size_t found = 0;
-    auto* sec = IMAGE_FIRST_SECTION(nt);
-    for (WORD s = 0; s < nt->FileHeader.NumberOfSections; ++s, ++sec) {
-        if (sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) continue;
-        if (!(sec->Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
-
-        const uintptr_t lo  = m.base + sec->VirtualAddress;
-        const uintptr_t end = lo + sec->Misc.VirtualSize;
-
-        for (uintptr_t at = lo; at + 0x80 <= end; at += 8) {
-            const auto* b = reinterpret_cast<const uint8_t*>(at);
-
-            uintptr_t next = 0;
-            memcpy(&next, b, 8);
-            if (next && (next < lo || next >= end)) continue;
-
-            uint32_t count = 0;
-            memcpy(&count, b + 0x78, 4);
-            if (count < 1 || count > 7) continue;
-
-            bool ok = true;
-            for (size_t k = 0; k < 7 && ok; ++k) {
-                uint64_t hash = 0; void* fn = nullptr;
-                memcpy(&hash, b + 0x08 + k * 8, 8);
-                memcpy(&fn, b + 0x40 + k * 8, 8);
-                if (!hash) { ok = false; break; }
-                if (IsExec(static_cast<uintptr_t>(hash))) { ok = false; break; }
-                if (!IsExec(reinterpret_cast<uintptr_t>(fn))) { ok = false; break; }
-            }
-            if (!ok) continue;
-
-            for (size_t k = 0; k < 7; ++k) {
-                uint64_t hash = 0; void* fn = nullptr;
-                memcpy(&hash, b + 0x08 + k * 8, 8);
-                memcpy(&fn, b + 0x40 + k * 8, 8);
-                g_map[hash] = fn;
-            }
-            ++found;
-            at += 0x78;
-        }
-    }
-    return found;
-}
-
-void* Lookup(uint64_t hash) {
-    if (g_getHandler) return Ask(hash);
-    const auto it = g_map.find(hash);
-    return it == g_map.end() ? nullptr : it->second;
-}
-
-bool Validate() {
-    for (uint64_t h : kValidate)
-        if (!Lookup(h)) return false;
+    Log("[natives] disposicion %d valida (player=%lld ped=%lld)", layout,
+        static_cast<long long>(id), static_cast<long long>(ped));
     return true;
 }
 
-size_t TryHarvestBlocks(const ModuleInfo& m) {
-    __try {
-        return HarvestBlocks(m);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return 0;
-    }
-}
-
 bool Resolve() {
-    BuildExec();
-    if (g_exec.empty()) { g_status = "sin rangos ejecutables"; return false; }
+    HMODULE h = GetModuleHandleW(L"scripting-gta.dll");
+    if (!h) { g_status = "scripting-gta.dll no cargado"; return false; }
 
-    if (ResolveViaExports()) {
-        Log("[natives] %s", g_status);
-        return true;
-    }
+    auto* fn = FindExport(h, "scripting-gta.dll", "callnativehandler");
+    if (!fn) { g_status = "sin CallNativeHandler"; return false; }
 
-    Log("[natives] exportaciones sin resultado, se prueba el cosechado");
-    for (auto& m : modules::All()) {
-        std::string l = Lower(m.name);
-        if (l.find("gtaprocess") == std::string::npos && l.find("gta5") == std::string::npos) continue;
+    g_callNative = reinterpret_cast<CallNative_t>(fn);
+    Log("[natives] CallNativeHandler en %p", fn);
 
-        const size_t n = TryHarvestBlocks(m);
-        Log("[natives] %s: %zu bloques", m.name.c_str(), n);
-        if (n && Validate()) {
-            g_status = "resueltas (cosecha)";
-            Log("[natives] cosechadas %zu nativas", g_map.size());
+    for (int layout : { 1, 2, 3, 4 }) {
+        if (TryLayout(layout)) {
+            static const char* kLabels[] = {
+                "", "resueltas (A)", "resueltas (B)", "resueltas (C)", "resueltas (D)"
+            };
+            g_status = kLabels[layout];
             return true;
         }
+        Log("[natives] disposicion %d no cuadra", layout);
     }
 
-    g_status = "tabla de nativas no encontrada";
+    g_callNative = nullptr;
+    g_status = "el contexto no valida";
     return false;
+}
+
+bool TryResolve() {
+    __try {
+        return Resolve();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        LogE("[natives] excepcion resolviendo");
+        return false;
+    }
 }
 } // namespace
 
@@ -285,48 +197,42 @@ namespace natives {
 
 bool init() {
     if (g_ready) return true;
-    bool ok = false;
-    __try { ok = Resolve(); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { LogE("[natives] excepcion resolviendo"); }
+    static const char* s_lastLoggedStatus = nullptr;
+    g_missing.clear();
+    const bool ok = TryResolve();
     g_ready = ok;
-    if (!ok) LogE("[natives] %s", g_status);
+    if (ok) {
+        Log("[natives] %s", g_status);
+        s_lastLoggedStatus = g_status;
+    } else if (s_lastLoggedStatus != g_status) {
+        LogE("[natives] %s", g_status);
+        s_lastLoggedStatus = g_status;
+    }
     return ok;
 }
 
 bool ready() { return g_ready; }
 const char* statusText() { return g_status; }
 
-bool has(uint64_t hash) { return g_ready && Lookup(hash) != nullptr; }
+bool has(uint64_t hash) {
+    return g_ready && g_missing.find(hash) == g_missing.end();
+}
 
 bool call(uint64_t hash, void* ret, int argCount, const uint64_t* args) {
     if (!g_ready) return false;
-    void* fn = Lookup(hash);
-    if (!fn) return false;
-
-    alignas(16) uint8_t vecData[48]{};
-    NativeContext ctx;
-    ctx.retn      = ret;
-    ctx.argCount  = static_cast<uint32_t>(argCount);
-    ctx.args      = const_cast<uint64_t*>(args);
-    ctx.dataCount = 0;
-    ctx.vector    = vecData;
-
-    __try {
-        reinterpret_cast<Handler_t>(fn)(&ctx);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-    return true;
+    return Raw(hash, reinterpret_cast<uint8_t*>(ret), static_cast<uint32_t>(argCount), args);
 }
 
 void v_void(uint64_t hash, int argc, const uint64_t* args) {
+    if (!g_ready) return;
     alignas(16) uint8_t ret[64]{};
-    call(hash, ret, argc, args);
+    Raw(hash, ret, static_cast<uint32_t>(argc), args);
 }
 
 int64_t v_int(uint64_t hash, int argc, const uint64_t* args) {
+    if (!g_ready) return 0;
     alignas(16) uint8_t ret[64]{};
-    if (!call(hash, ret, argc, args)) return 0;
+    if (!Raw(hash, ret, static_cast<uint32_t>(argc), args)) return 0;
     return *reinterpret_cast<int64_t*>(ret);
 }
 } // namespace natives
