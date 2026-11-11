@@ -5,48 +5,38 @@
 
 #include <Windows.h>
 #include <cstring>
+#include <unordered_map>
 #include <vector>
 
 namespace {
 
 // ---------------------------------------------------------------- hashes
 
-// Todas opcionales: si una no resuelve, la feature que la usa se apaga sola en
-// vez de llamar a la nativa equivocada.
 enum : uint64_t {
-    H_PLAYER_ID                        = 0x4F8644AF03D0E0D6,
-    H_PLAYER_PED_ID                    = 0xD80958FC74E988A6,
-    H_GET_PLAYER_PED                   = 0x43A66C31C68491C0,
-    H_NETWORK_IS_PLAYER_ACTIVE         = 0xB8DFD30D6973E135,
-    H_GET_ENTITY_COORDS                = 0x3FEF770D40960D5A,
-    H_GET_ENTITY_HEALTH                = 0xEEF059FAD016D209,
-    H_GET_ENTITY_HEADING               = 0xE83D4F9BA2A38914,
-    H_GET_PED_BONE_COORDS              = 0x17C07FC640E86B4E,
-    H_GET_SCREEN_COORD_FROM_WORLD      = 0x34E82F05DF2974F5,
-    H_GET_PLAYER_NAME                  = 0x6D0DE6A7B5DA71F8,
-    H_SET_PLAYER_INVINCIBLE            = 0x239528EACDC3E7DE,
-    H_SET_ENTITY_INVINCIBLE            = 0x3882114BDE571AD4,
-    H_SET_SUPER_JUMP_THIS_FRAME        = 0x57FFF03E423A4C0B,
-    H_GET_GAMEPLAY_CAM_COORD           = 0x14D6F5678D8F1B37,
-    H_SET_CAM_RELATIVE_HEADING         = 0xC2AB6BF4E8A9C5F7,
-    H_SET_CAM_RELATIVE_PITCH           = 0x2F5C4B1C1C7E1A28,
+    H_PLAYER_ID                   = 0x4F8644AF03D0E0D6,
+    H_PLAYER_PED_ID               = 0xD80958FC74E988A6,
+    H_GET_PLAYER_PED              = 0x43A66C31C68491C0,
+    H_NETWORK_IS_PLAYER_ACTIVE    = 0xB8DFD30D6973E135,
+    H_GET_ENTITY_COORDS           = 0x3FEF770D40960D5A,
+    H_GET_ENTITY_HEALTH           = 0xEEF059FAD016D209,
+    H_GET_PED_BONE_COORDS         = 0x17C07FC640E86B4E,
+    H_GET_SCREEN_COORD_FROM_WORLD = 0x34E82F05DF2974F5,
+    H_GET_PLAYER_NAME             = 0x6D0DE6A7B5DA71F8,
+    H_SET_PLAYER_INVINCIBLE       = 0x239528EACDC3E7DE,
+    H_SET_ENTITY_INVINCIBLE       = 0x3882114BDE571AD4,
+    H_SET_SUPER_JUMP_THIS_FRAME   = 0x57FFF03E423A4C0B,
+    H_GET_GAMEPLAY_CAM_COORD      = 0x14D6F5678D8F1B37,
+    H_SET_CAM_RELATIVE_HEADING    = 0xC2AB6BF4E8A9C5F7,
+    H_SET_CAM_RELATIVE_PITCH      = 0x2F5C4B1C1C7E1A28,
+    H_GET_ACTIVE_SCREEN_RES       = 0x2E397A4B1C4B6F4F,
 };
 
-// Hashes de validacion: si estos tres no resuelven, la tabla es falsa.
 constexpr uint64_t kValidate[] = { H_PLAYER_ID, H_PLAYER_PED_ID, H_GET_ENTITY_COORDS };
 
-// ---------------------------------------------------------------- layout
-
-// rage::scrNativeRegistration: lista enlazada de bloques con hashes/handlers.
-// La tabla global es un array de 256 punteros indexado por hash & 0xFF.
-constexpr size_t kEntriesPerBlock = 7;
-constexpr size_t kHashesOffset    = 0x08;
-constexpr size_t kHandlersOffset  = 0x08 + kEntriesPerBlock * 8;
-constexpr size_t kCountOffset     = kHandlersOffset + kEntriesPerBlock * 8;
+// ---------------------------------------------------------------- contexto
 
 using Handler_t = void (*)(void*);
 
-// rage::scrNativeCallContext
 struct NativeContext {
     void*    retn      = nullptr;
     uint32_t argCount  = 0;
@@ -57,103 +47,130 @@ struct NativeContext {
     void*    vector    = nullptr;
 };
 
-void**   g_table  = nullptr;
-bool     g_ready  = false;
+std::unordered_map<uint64_t, void*> g_map;
+bool        g_ready  = false;
 const char* g_status = "sin resolver";
 
-bool PlausibleExec(uintptr_t p) {
-    if (!p) return false;
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (!VirtualQuery(reinterpret_cast<LPCVOID>(p), &mbi, sizeof(mbi))) return false;
-    if (mbi.State != MEM_COMMIT) return false;
-    const DWORD prot = mbi.Protect & 0xFF;
-    return prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE ||
-           prot == PAGE_EXECUTE_WRITECOPY || prot == PAGE_EXECUTE;
+struct Range { uintptr_t lo, hi; };
+std::vector<Range> g_exec;
+
+bool IsExec(uintptr_t p) {
+    for (const auto& r : g_exec)
+        if (p >= r.lo && p < r.hi) return true;
+    return false;
 }
 
-// Recorre la tabla igual que el motor. Sin guard por fuera: el llamante mete
-// esto en un __try.
-void* Lookup(uint64_t hash) {
-    if (!g_table) return nullptr;
-    auto* block = reinterpret_cast<uint8_t*>(g_table[hash & 0xFF]);
-    int guard = 0;
-    while (block && guard++ < 512) {
-        const auto count = *reinterpret_cast<uint32_t*>(block + kCountOffset);
-        if (count > 0 && count <= kEntriesPerBlock) {
-            auto* hashes = reinterpret_cast<uint64_t*>(block + kHashesOffset);
-            auto* fns    = reinterpret_cast<void**>(block + kHandlersOffset);
-            for (uint32_t i = 0; i < count; ++i)
-                if (hashes[i] == hash && PlausibleExec(reinterpret_cast<uintptr_t>(fns[i])))
-                    return fns[i];
+// ---------------------------------------------------------------- cosecha
+
+// Recorre las secciones escribibles del modulo buscando rachas de punteros a
+// codigo. Un bloque de registro es exactamente eso, y los kEntries qwords que
+// hay JUSTO ANTES son sus hashes. No depende de ningun patron de bytes ni del
+// offset del contador, asi que aguanta cambios de build.
+size_t Harvest(const ModuleInfo& m, size_t entries) {
+    auto* dos = reinterpret_cast<PIMAGE_DOS_HEADER>(m.base);
+    if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    auto* nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(m.base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+
+    std::vector<Range> data;
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+        const uintptr_t lo = m.base + sec->VirtualAddress;
+        const uintptr_t hi = lo + sec->Misc.VirtualSize;
+        if (sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) {
+            g_exec.push_back({ lo, hi });
+        } else if (sec->Characteristics & IMAGE_SCN_MEM_WRITE) {
+            data.push_back({ lo, hi });
         }
-        block = *reinterpret_cast<uint8_t**>(block);
     }
-    return nullptr;
+    if (g_exec.empty() || data.empty()) return 0;
+
+    size_t pairs = 0;
+    for (const auto& r : data) {
+        const auto* p = reinterpret_cast<const uint64_t*>(r.lo);
+        const size_t n = (r.hi - r.lo) / 8;
+        size_t run = 0;
+
+        for (size_t i = 0; i < n; ++i) {
+            if (IsExec(static_cast<uintptr_t>(p[i]))) { ++run; continue; }
+
+            if (run >= entries) {
+                const size_t firstHandler = i - run;
+                if (firstHandler >= entries) {
+                    const uint64_t* hashes = p + firstHandler - entries;
+                    const uint64_t* fns    = p + firstHandler;
+                    for (size_t k = 0; k < entries; ++k) {
+                        const uint64_t h = hashes[k];
+                        if (h && IsExec(static_cast<uintptr_t>(fns[k])))
+                            g_map[h] = reinterpret_cast<void*>(fns[k]);
+                    }
+                    pairs += entries;
+                }
+            }
+            run = 0;
+        }
+    }
+    return pairs;
 }
 
-// Extrae el destino de un `lea rcx, [rip+disp32]` (48 8D 0D) en la posicion.
-uintptr_t LeaTarget(uintptr_t at) {
-    const auto* b = reinterpret_cast<const uint8_t*>(at);
-    int32_t disp = 0;
-    memcpy(&disp, b + 3, sizeof(disp));
-    return at + 7 + static_cast<intptr_t>(disp);
+void* Lookup(uint64_t hash) {
+    const auto it = g_map.find(hash);
+    return it == g_map.end() ? nullptr : it->second;
 }
 
-bool Validate(void** table) {
-    g_table = table;
+bool Validate() {
     for (uint64_t h : kValidate)
-        if (!Lookup(h)) { g_table = nullptr; return false; }
+        if (!Lookup(h)) return false;
     return true;
 }
 
-bool TryValidate(void** table) {
+size_t TryHarvest(const ModuleInfo& m, size_t entries, bool& faulted) {
+    faulted = false;
     __try {
-        return Validate(table);
+        return Harvest(m, entries);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        g_table = nullptr;
-        return false;
+        faulted = true;
+        return 0;
     }
 }
-
-// Candidatos al lea que referencia rage::scrNativeRegistrationTable. Se prueban
-// todos y se queda el primero que valide con los hashes conocidos.
-const char* kTablePatterns[] = {
-    "48 8D 0D ? ? ? ? 48 8B D0 E8 ? ? ? ? 48 8B 5C 24 30",
-    "48 8D 0D ? ? ? ? 48 8B D0 E8 ? ? ? ? 48 8B 5C 24 20",
-    "48 8D 0D ? ? ? ? E8 ? ? ? ? 48 8B D8 48 85 DB",
-};
 
 std::vector<ModuleInfo> Order() {
     std::vector<ModuleInfo> out;
     for (auto& m : modules::All()) {
         std::string l = m.name;
         for (auto& c : l) c = (char)::tolower((unsigned char)c);
-        if (l.find("gta-core-five") != std::string::npos ||
-            l.find("gtaprocess") != std::string::npos ||
-            l.find("gta5") != std::string::npos)
+        if (l.find("gtaprocess") != std::string::npos || l.find("gta5") != std::string::npos)
             out.push_back(m);
+    }
+    for (auto& m : modules::All()) {
+        std::string l = m.name;
+        for (auto& c : l) c = (char)::tolower((unsigned char)c);
+        if (l.find("gta-core-five") != std::string::npos) out.push_back(m);
     }
     return out;
 }
 
 bool Resolve() {
     for (auto& m : Order()) {
-        for (const char* pat : kTablePatterns) {
-            const auto hits = scanner::FindAll(m, pat, 8);
-            for (auto hit : hits) {
-                if (!scanner::InExecutableSection(hit)) continue;
-                auto** table = reinterpret_cast<void**>(LeaTarget(hit));
-                if (!table) continue;
+        // El numero de entradas por bloque cambia entre builds: se prueban los
+        // dos y se queda el que valide con hashes conocidos.
+        for (size_t entries : { size_t(7), size_t(8) }) {
+            g_map.clear();
+            g_exec.clear();
 
-                if (TryValidate(table)) {
-                    Log("[natives] tabla en %s+0x%llX", m.name.c_str(),
-                        static_cast<unsigned long long>(hit - m.base));
-                    g_status = "resueltas";
-                    return true;
-                }
-                Log("[natives] candidato descartado %s+0x%llX", m.name.c_str(),
-                    static_cast<unsigned long long>(hit - m.base));
+            bool faulted = false;
+            const size_t pairs = TryHarvest(m, entries, faulted);
+            if (faulted) LogE("[natives] excepcion cosechando %s", m.name.c_str());
+            if (!pairs) continue;
+
+            Log("[natives] %s: %zu pares con bloques de %zu", m.name.c_str(), pairs, entries);
+            if (Validate()) {
+                Log("[natives] tabla cosechada de %s (bloques de %zu, %zu nativas)",
+                    m.name.c_str(), entries, g_map.size());
+                g_status = "resueltas";
+                return true;
             }
+            Log("[natives] %s: sin validar con bloques de %zu", m.name.c_str(), entries);
         }
     }
     g_status = "tabla de nativas no encontrada";
@@ -176,17 +193,11 @@ bool init() {
 bool ready() { return g_ready; }
 const char* statusText() { return g_status; }
 
-bool has(uint64_t hash) {
-    if (!g_ready) return false;
-    __try { return Lookup(hash) != nullptr; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-}
+bool has(uint64_t hash) { return g_ready && Lookup(hash) != nullptr; }
 
 bool call(uint64_t hash, void* ret, int argCount, const uint64_t* args) {
     if (!g_ready) return false;
-    void* fn = nullptr;
-    __try { fn = Lookup(hash); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    void* fn = Lookup(hash);
     if (!fn) return false;
 
     alignas(16) uint8_t vecData[48]{};
