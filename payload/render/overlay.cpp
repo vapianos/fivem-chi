@@ -9,7 +9,6 @@
 #include <dxgi.h>
 #include <dxgi1_2.h>
 #include <atomic>
-#include <exception>
 
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -33,10 +32,12 @@ constexpr size_t kIdxPresent  = 8;
 constexpr size_t kIdxResize   = 13;
 constexpr size_t kIdxPresent1 = 22;
 
-// Tras este numero de fallos seguidos se desarma el overlay en vez de dejar
-// que el proceso acabe palmando.
 constexpr int kFaultLimit = 30;
 
+// Los originales se capturan UNA vez, al armar, y no se re-derivan nunca.
+// FiveM tambien engancha Present: si su trampolin se recrea y nosotros
+// releyeramos la casilla, o_present acabaria apuntando a memoria muerta y el
+// hilo principal se va de cabeza.
 Present_t   o_present  = nullptr;
 Present1_t  o_present1 = nullptr;
 ResizeBuf_t o_resize   = nullptr;
@@ -165,6 +166,16 @@ bool PatchSlot(void** vtable, size_t index, void* hook, void** original) {
     vtable[index] = hook;
     VirtualProtect(&vtable[index], sizeof(void*), old, &old);
     return true;
+}
+
+// Reafirma NUESTRA casilla sin tocar el original.
+void ReassertSlot(void** vtable, size_t index, void* hook) {
+    if (!vtable || !hook || vtable[index] == hook) return;
+    DWORD old = 0;
+    if (VirtualProtect(&vtable[index], sizeof(void*), PAGE_READWRITE, &old)) {
+        vtable[index] = hook;
+        VirtualProtect(&vtable[index], sizeof(void*), old, &old);
+    }
 }
 
 void RestoreSlot(void** vtable, size_t index, void* original) {
@@ -351,7 +362,6 @@ void DropDevice() {
     g_ready = false;
 }
 
-// Fusible: se desarma solo. El juego sigue vivo con el menu y el ESP apagados.
 void Disarm(const char* why) {
     LogE("overlay desarmado: %s", why);
     g_dead = true;
@@ -361,10 +371,12 @@ void Disarm(const char* why) {
         RestoreSlot(g_vtable, kIdxPresent1, reinterpret_cast<void*>(o_present1));
         g_armed = false;
     }
-    if (g_hwnd && o_wndproc)
-        SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(o_wndproc));
-    o_wndproc = nullptr;
-    DropDevice();
+    __try {
+        if (g_hwnd && o_wndproc)
+            SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(o_wndproc));
+        o_wndproc = nullptr;
+        DropDevice();
+    } __except (EXCEPTION_EXECUTE_HANDLER) { LogE("excepcion desarmando"); }
 }
 
 void DrawFrameUnsafe() {
@@ -418,18 +430,14 @@ void PrepareAndDraw(IDXGISwapChain* swap) {
     if (!g_loggedFirst) { g_loggedFirst = true; Log("primer Present recibido"); }
     ++g_frames;
 
+    // Solo se reafirma lo nuestro; el original ya no se re-deriva.
     if (g_armed && g_frames % 120 == 0) {
-        if (g_vtable[kIdxPresent] != reinterpret_cast<void*>(&hkPresent)) {
-            if (g_vtable[kIdxPresent]) o_present = reinterpret_cast<Present_t>(g_vtable[kIdxPresent]);
-            PatchSlot(g_vtable, kIdxPresent, reinterpret_cast<void*>(&hkPresent), nullptr);
-        }
-        if (o_present1 && g_vtable[kIdxPresent1] != reinterpret_cast<void*>(&hkPresent1)) {
-            if (g_vtable[kIdxPresent1]) o_present1 = reinterpret_cast<Present1_t>(g_vtable[kIdxPresent1]);
-            PatchSlot(g_vtable, kIdxPresent1, reinterpret_cast<void*>(&hkPresent1), nullptr);
-        }
+        ReassertSlot(g_vtable, kIdxPresent, reinterpret_cast<void*>(&hkPresent));
+        if (o_present1) ReassertSlot(g_vtable, kIdxPresent1, reinterpret_cast<void*>(&hkPresent1));
         if (config::Get().hookWndProc && g_hwnd && o_wndproc &&
             GetWindowLongPtrW(g_hwnd, GWLP_WNDPROC) != reinterpret_cast<LONG_PTR>(hkWndProc))
             SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(hkWndProc));
+        if (g_frames % 600 == 0) Log("frames=%llu", g_frames);
     }
 
     PollKeys();
@@ -445,9 +453,6 @@ void PrepareAndDraw(IDXGISwapChain* swap) {
 
     if (!g_visible && !native::ready()) return;
 
-    // El estado se guarda y se restaura SIEMPRE, tambien si salta una excepcion
-    // SEH: con __finally no se pierde ni el render target del juego ni las
-    // referencias, que era lo que se iba acumulando hasta reventar.
     D3DState state{};
     __try {
         SaveState(state);
@@ -603,6 +608,8 @@ bool CreateSwapChainHook() {
     g_dead = false;
     g_armed = true;
     Log("vtable parcheada (Present%s + ResizeBuffers)", okP1 ? " + Present1" : "");
+    Log("originales: present=%p present1=%p", reinterpret_cast<void*>(o_present),
+        reinterpret_cast<void*>(o_present1));
     return true;
 }
 } // namespace

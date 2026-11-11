@@ -55,9 +55,6 @@ bool IsExec(uintptr_t p) {
     return false;
 }
 
-// Los handlers NO estan en el ejecutable: FiveM los reescribe a sus propios
-// modulos y a bloques asignados. Hay que recoger las secciones ejecutables de
-// TODOS los modulos, no solo del que contiene la tabla.
 void BuildExec() {
     g_exec.clear();
     for (auto& m : modules::All()) {
@@ -75,9 +72,8 @@ void BuildExec() {
 }
 
 // En un bloque de registro el hash de la entrada k esta exactamente `entries`
-// posiciones antes de su handler. Asi que por cada puntero a codigo se mira
-// `entries` atras y se empareja. No hace falta alinear bloques ni leer el
-// contador, y un handler que FiveM haya dejado a 0 no rompe la deteccion.
+// posiciones antes de su handler, asi que por cada puntero a codigo se mira
+// `entries` atras. No hay que alinear bloques ni leer contadores.
 size_t Harvest(const ModuleInfo& m, size_t entries) {
     auto* dos = reinterpret_cast<PIMAGE_DOS_HEADER>(m.base);
     if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
@@ -90,17 +86,34 @@ size_t Harvest(const ModuleInfo& m, size_t entries) {
         if (sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) continue;
         if (!(sec->Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
 
-        const uintptr_t lo = m.base + sec->VirtualAddress;
-        const auto* p = reinterpret_cast<const uint64_t*>(lo);
-        const size_t n = sec->Misc.VirtualSize / 8;
+        const uintptr_t lo  = m.base + sec->VirtualAddress;
+        const uintptr_t end = lo + sec->Misc.VirtualSize;
+        uintptr_t cur = lo;
 
-        for (size_t i = entries; i < n; ++i) {
-            const uintptr_t fn = static_cast<uintptr_t>(p[i]);
-            if (!IsExec(fn)) continue;
-            const uint64_t h = p[i - entries];
-            if (!h || IsExec(static_cast<uintptr_t>(h))) continue;
-            g_map[h] = reinterpret_cast<void*>(fn);
-            ++pairs;
+        while (cur < end) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery(reinterpret_cast<LPCVOID>(cur), &mbi, sizeof(mbi))) break;
+
+            uintptr_t rEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+            if (rEnd > end) rEnd = end;
+
+            const bool usable = mbi.State == MEM_COMMIT &&
+                                !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS));
+
+            if (usable && rEnd > cur + entries * 8) {
+                const auto* p = reinterpret_cast<const uint64_t*>(cur);
+                const size_t n = (rEnd - cur) / 8;
+                for (size_t i = entries; i < n; ++i) {
+                    const uintptr_t fn = static_cast<uintptr_t>(p[i]);
+                    if (!IsExec(fn)) continue;
+                    const uint64_t h = p[i - entries];
+                    if (!h || IsExec(static_cast<uintptr_t>(h))) continue;
+                    g_map[h] = reinterpret_cast<void*>(fn);
+                    ++pairs;
+                }
+                Sleep(0);   // cede el hilo cada region
+            }
+            cur = rEnd;
         }
     }
     return pairs;
@@ -162,9 +175,7 @@ bool Resolve() {
     BuildExec();
     if (g_exec.empty()) { g_status = "sin rangos ejecutables"; return false; }
 
-    for (size_t entries : { size_t(7), size_t(8) }) {
-        // Primero el ejecutable del juego (donde vive la tabla), luego los
-        // modulos de FiveM por si el bloque se mudo de sitio.
+    for (size_t entries : { size_t(7), size_t(8), size_t(6), size_t(9) }) {
         g_map.clear();
         size_t a = 0, b = 0;
         if (TryHarvest(GameModules(), entries, &a)) return true;
