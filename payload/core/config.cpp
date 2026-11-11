@@ -9,9 +9,6 @@
 namespace {
 
 Config g_config;
-
-// SRWLOCK_INIT es un inicializador constante: no hay constructor estatico ni
-// funcion de init, y por tanto nada que pueda fallar al arrancar.
 SRWLOCK g_lock = SRWLOCK_INIT;
 
 struct Guard {
@@ -39,7 +36,6 @@ void Apply(const char* key, size_t keyLen, const char* val, size_t valLen) {
     else if (Same(key, keyLen, "natives"))        g_config.nativesEnabled = n != 0;
 }
 
-// Se llama siempre con el lock tomado: nunca reentra en Save().
 void SaveLocked() {
     const std::wstring dir = paths::DataDirW();
     paths::EnsureDirW(dir);
@@ -109,7 +105,6 @@ void Load() {
         const char* line = buf + i;
         size_t len = end - i;
 
-        // recorte
         while (len && (line[0] == ' ' || line[0] == '\t' || line[0] == '\r')) { ++line; --len; }
         while (len && (line[len - 1] == ' ' || line[len - 1] == '\t' || line[len - 1] == '\r')) --len;
 
@@ -121,7 +116,6 @@ void Load() {
                 while (keyLen && (key[keyLen - 1] == ' ' || key[keyLen - 1] == '\t')) --keyLen;
 
                 const char* val = eq + 1;
-                // el valor arranca justo tras el '=', no tras la clave recortada
                 size_t valLen = len - static_cast<size_t>(eq - line) - 1;
                 while (valLen && (*val == ' ' || *val == '\t')) { ++val; --valLen; }
 

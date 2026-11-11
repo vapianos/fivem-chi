@@ -12,6 +12,7 @@ static HMODULE   g_self     = nullptr;
 static uintptr_t g_base     = 0;
 static size_t    g_size     = 0;
 static volatile LONG g_unloadReq = 0;
+static volatile LONG g_vehCount  = 0;
 
 static void BootMark(const char* text) {
     wchar_t dir[MAX_PATH]{};
@@ -86,12 +87,33 @@ static void LogFrame(const char* prefix, uintptr_t addr) {
     char path[MAX_PATH]{};
     uintptr_t mod = 0;
     if (ModuleNameOf(addr, path, sizeof(path), &mod)) {
+        const char* leaf = strrchr(path, '\\');
         if (!path[0]) lstrcpyA(path, "(payload)");
-        LogE("%s %p %s+0x%llX", prefix, reinterpret_cast<void*>(addr), path,
+        LogE("%s %p %s+0x%llX", prefix, reinterpret_cast<void*>(addr), leaf ? leaf + 1 : path,
              static_cast<unsigned long long>(addr - mod));
     } else {
         LogE("%s %p (fuera de modulo)", prefix, reinterpret_cast<void*>(addr));
     }
+}
+
+// Primera pasada: se apunta el fallo ANTES de que FiveM lo intercepte. Se
+// devuelve CONTINUE_SEARCH para no alterar el manejo normal.
+static LONG CALLBACK VehFilter(EXCEPTION_POINTERS* ep) {
+    const LONG n = InterlockedIncrement(&g_vehCount);
+    if (n > 20) return EXCEPTION_CONTINUE_SEARCH;
+
+    const auto* rec = ep->ExceptionRecord;
+    BootMark("VEH");
+    LogE("=== VEH 0x%08X (fallo %ld)", rec->ExceptionCode, n);
+    LogFrame("  rip", reinterpret_cast<uintptr_t>(rec->ExceptionAddress));
+
+    void* frames[20]{};
+    const USHORT c = RtlCaptureStackBackTrace(0, 20, frames, nullptr);
+    for (USHORT i = 0; i < c; ++i)
+        LogFrame("  #", reinterpret_cast<uintptr_t>(frames[i]));
+
+    if (n == 20) BootMark("VEH: se dejan de registrar fallos");
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
 static bool SelfImportsRuntime() {
@@ -183,6 +205,8 @@ static DWORD WINAPI Init(LPVOID) {
     paths::EnsureDirW(paths::DataDirW());
     LogInit();
     BootMark("log inicializado");
+
+    AddVectoredExceptionHandler(1, VehFilter);
     SetUnhandledExceptionFilter(CrashFilter);
     CaptureRange();
 

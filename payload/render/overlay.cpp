@@ -425,20 +425,27 @@ void PrepareAndDraw(IDXGISwapChain* swap) {
             return;
         }
     }
-    if (swap != g_swap) return;
-    if (!g_rtv && !CreateRtv(swap)) return;
+    if (swap != g_swap) {
+        static bool saidSwap = false;
+        if (!saidSwap) { saidSwap = true; Log("present de otro swapchain, se ignora"); }
+        return;
+    }
+    if (!g_rtv && !CreateRtv(swap)) {
+        static bool saidRtv = false;
+        if (!saidRtv) { saidRtv = true; LogE("sin render target en Present, no se dibuja"); }
+        return;
+    }
 
     if (!g_loggedFirst) { g_loggedFirst = true; Log("primer Present recibido"); }
     ++g_frames;
 
-    // Solo se reafirma lo nuestro; el original ya no se re-deriva.
     if (g_armed && g_frames % 120 == 0) {
         ReassertSlot(g_vtable, kIdxPresent, reinterpret_cast<void*>(&hkPresent));
         if (o_present1) ReassertSlot(g_vtable, kIdxPresent1, reinterpret_cast<void*>(&hkPresent1));
         if (config::Get().hookWndProc && g_hwnd && o_wndproc &&
             GetWindowLongPtrW(g_hwnd, GWLP_WNDPROC) != reinterpret_cast<LONG_PTR>(hkWndProc))
             SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(hkWndProc));
-        if (g_frames % 600 == 0) Log("frames=%llu", g_frames);
+        Log("frames=%llu visible=%d", g_frames, g_visible ? 1 : 0);
     }
 
     PollKeys();
