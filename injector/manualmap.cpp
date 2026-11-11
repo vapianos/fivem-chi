@@ -144,6 +144,34 @@ uintptr_t RemoteExport(HANDLE proc, uintptr_t modBase, const char* name, WORD or
     return modBase + funcRva;
 }
 
+// Un modulo que no esta cargado en el destino no se puede resolver con
+// GetProcAddress del inyector: esa direccion vive en NUESTRO espacio, no en el
+// suyo. Hay que forzar la carga alli y resolver contra su copia.
+uintptr_t RemoteLoadModule(HANDLE proc, DWORD pid, const char* name) {
+    auto mods = RemoteModules(pid);
+    if (uintptr_t already = RemoteModuleBase(mods, name)) return already;
+
+    SIZE_T len = strlen(name) + 1;
+    void* mem = nullptr;
+    if (pAlloc(proc, &mem, 0, &len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) != 0 || !mem) return 0;
+    if (!RemoteWrite(proc, (uintptr_t)mem, name, len)) return 0;
+
+    uintptr_t loadAddr = RemoteExport(proc, RemoteModuleBase(mods, "kernel32.dll"),
+                                      "LoadLibraryA", 0, false);
+    if (!loadAddr)
+        loadAddr = RemoteExport(proc, RemoteModuleBase(mods, "kernelbase.dll"),
+                                "LoadLibraryA", 0, false);
+    if (!loadAddr) return 0;
+
+    HANDLE th = nullptr;
+    if (pThread(&th, 0x1FFFFF, nullptr, proc, (void*)loadAddr, mem, 0, 0, 0, 0, nullptr) != 0 || !th)
+        return 0;
+    WaitForSingleObject(th, 5000);
+    CloseHandle(th);
+
+    return RemoteModuleBase(RemoteModules(pid), name);
+}
+
 // --- stub de arranque ------------------------------------------------------
 
 // Convencion x64: RSP alineada a 16 justo antes de cada `call`. Al entrar en un
@@ -151,7 +179,7 @@ uintptr_t RemoteExport(HANDLE proc, uintptr_t modBase, const char* name, WORD or
 // de 16 y la alineacion se mantiene en 0.
 //
 // rcx = base (lpParameter del hilo).
-// 1) callbacks TLS con reason = DLL_PROCESS_ATTACH -> inicializa _tls_index
+// 1) callbacks TLS con reason = DLL_PROCESS_ATTACH
 // 2) RtlAddFunctionTable(base + pdata, size, base)  -> registra unwind
 // 3) DllMain(base, DLL_PROCESS_ATTACH, 0) y guarda su retorno en `scratch`
 std::vector<uint8_t> BuildStub(uintptr_t base, uintptr_t entry, uintptr_t addTable,
@@ -263,7 +291,6 @@ bool MapEx(HANDLE proc, const std::vector<uint8_t>& dll, std::string& err, uintp
     std::wstring file;
     if (!WriteTempDll(dll, file)) { err = "no se pudo escribir el temporal"; return false; }
 
-    // Una seccion de imagen exige acceso de ejecucion sobre el fichero.
     HANDLE fh = CreateFileW(file.c_str(), GENERIC_READ | GENERIC_EXECUTE, FILE_SHARE_READ,
                             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (fh == INVALID_HANDLE_VALUE) { DeleteFileW(file.c_str()); err = "no se pudo abrir el temporal"; return false; }
@@ -293,7 +320,8 @@ bool MapEx(HANDLE proc, const std::vector<uint8_t>& dll, std::string& err, uintp
     const uintptr_t img = (uintptr_t)base;
     const uintptr_t delta = img - nt->OptionalHeader.ImageBase;
 
-    // 4. reubicaciones
+    // 4. reubicaciones. Si un write falla, la imagen queda mal rebasada y el
+    //    fallo aparece en DllMain sin traza: se comprueba.
     if (delta && !(nt->FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED)) {
         const auto& rdir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
         if (rdir.Size) {
@@ -309,26 +337,27 @@ bool MapEx(HANDLE proc, const std::vector<uint8_t>& dll, std::string& err, uintp
                     uintptr_t val = 0;
                     if (!RemoteRead(proc, at, &val, sizeof(val))) continue;
                     val += delta;
-                    RemoteWrite(proc, at, &val, sizeof(val));
+                    if (!RemoteWrite(proc, at, &val, sizeof(val))) {
+                        err = "reubicacion no escrita";
+                        return false;
+                    }
                 }
                 reloc = (PIMAGE_BASE_RELOCATION)((uint8_t*)reloc + reloc->SizeOfBlock);
             }
         }
     }
 
-    // 5. imports resueltos contra los modulos DEL DESTINO
-    const auto mods = RemoteModules(pid);
+    // 5. imports resueltos SIEMPRE contra los modulos DEL DESTINO
     const auto& impDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (impDir.Size) {
         auto* imp = (PIMAGE_IMPORT_DESCRIPTOR)(dll.data() + impDir.VirtualAddress);
         for (; imp->Name; ++imp) {
             const char* modName = (const char*)dll.data() + imp->Name;
-            uintptr_t modBase = RemoteModuleBase(mods, modName);
-            HMODULE local = nullptr;
+
+            const uintptr_t modBase = RemoteLoadModule(proc, pid, modName);
             if (!modBase) {
-                local = LoadLibraryA(modName);
-                if (!local) { err = std::string("import no disponible: ") + modName; return false; }
-                modBase = (uintptr_t)local;
+                err = std::string("import no disponible en el destino: ") + modName;
+                return false;
             }
 
             auto* thunk = (PIMAGE_THUNK_DATA)(dll.data() +
@@ -337,15 +366,19 @@ bool MapEx(HANDLE proc, const std::vector<uint8_t>& dll, std::string& err, uintp
                 uintptr_t fn = 0;
                 if (thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG) {
                     const WORD ord = (WORD)(thunk->u1.Ordinal & 0xFFFF);
-                    fn = local ? (uintptr_t)GetProcAddress(local, (LPCSTR)(uintptr_t)ord)
-                               : RemoteExport(proc, modBase, nullptr, ord, true);
+                    fn = RemoteExport(proc, modBase, nullptr, ord, true);
                 } else {
                     auto* by = (PIMAGE_IMPORT_BY_NAME)(dll.data() + thunk->u1.AddressOfData);
-                    fn = local ? (uintptr_t)GetProcAddress(local, (LPCSTR)by->Name)
-                               : RemoteExport(proc, modBase, (const char*)by->Name, 0, false);
+                    fn = RemoteExport(proc, modBase, (const char*)by->Name, 0, false);
                 }
-                if (!fn) { err = std::string("funcion no resuelta: ") + modName; return false; }
-                RemoteWrite(proc, img + imp->FirstThunk + i * sizeof(uintptr_t), &fn, sizeof(fn));
+                if (!fn) {
+                    err = std::string("funcion no resuelta en el destino: ") + modName;
+                    return false;
+                }
+                if (!RemoteWrite(proc, img + imp->FirstThunk + i * sizeof(uintptr_t), &fn, sizeof(fn))) {
+                    err = std::string("no se pudo escribir la IAT: ") + modName;
+                    return false;
+                }
             }
         }
     }

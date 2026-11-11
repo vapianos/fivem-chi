@@ -8,7 +8,7 @@
 namespace {
 struct Pattern {
     std::vector<uint8_t> bytes;
-    std::vector<bool>    mask; // true = comodín
+    std::vector<bool>    mask; // true = comodin
     size_t len = 0;
 };
 
@@ -49,18 +49,33 @@ bool Executable(DWORD protect) {
     }
 }
 
+// Ancla con el primer byte no comodin y salta con memchr: buscar 20 bytes a
+// fuerza bruta en un modulo de 3 MB tarda segundos y bloquea el escaneo.
 uintptr_t ScanRange(uintptr_t start, uintptr_t end, const Pattern& pat) {
     if (end <= start || end - start < pat.len) return 0;
     const uint8_t* base = reinterpret_cast<const uint8_t*>(start);
     const size_t   last = static_cast<size_t>(end - start - pat.len);
 
-    for (size_t i = 0; i <= last; ++i) {
+    size_t anchor = 0;
+    while (anchor < pat.len && pat.mask[anchor]) ++anchor;
+    if (anchor == pat.len) return start;
+
+    const uint8_t want = pat.bytes[anchor];
+
+    size_t i = 0;
+    while (i <= last) {
+        const uint8_t* hit = reinterpret_cast<const uint8_t*>(
+            memchr(base + i + anchor, want, last - i + 1));
+        if (!hit) return 0;
+        i = static_cast<size_t>(hit - base) - anchor;
+
         bool ok = true;
         for (size_t j = 0; j < pat.len; ++j) {
             if (pat.mask[j]) continue;
             if (base[i + j] != pat.bytes[j]) { ok = false; break; }
         }
         if (ok) return start + i;
+        ++i;
     }
     return 0;
 }

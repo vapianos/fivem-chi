@@ -229,15 +229,16 @@ static DWORD WINAPI Init(LPVOID) {
     if (!window) BootMark("sin ventana, el overlay no se puede armar");
 
     // Overlay PRIMERO: Insert tiene que responder aunque los natives no esten.
+    // Stage devuelve si no hubo excepcion, no lo que devolvio overlay::init():
+    // el resultado se captura dentro del lambda.
     Sleep(700);
     bool armed = false;
     for (int i = 0; i < 40 && !armed; ++i) {
-        armed = Stage("overlay", [] { overlay::init(); });
+        Stage("overlay", [&] { armed = overlay::init(); });
         if (!armed) Sleep(500);
     }
     BootMark(armed ? "overlay armado" : "overlay fallo");
 
-    // El escaneo corre en su hilo; la validacion la hace el render.
     if (window) Stage("native_scan", [] { native::init(); });
     if (mhook)  CloseHandle(CreateThread(nullptr, 0, LuaThread, nullptr, 0, nullptr));
 
@@ -253,9 +254,9 @@ extern "C" __declspec(dllexport) void Unload() {
 
 BOOL APIENTRY DllMain(HMODULE h, DWORD r, LPVOID) {
     if (r == DLL_PROCESS_ATTACH) {
-        BootMark("DllMain ATTACH");
         g_self = h;
         DisableThreadLibraryCalls(h);
+        // Nada de E/S bajo el loader lock: BootMark usa ficheros y puede colgar.
         CloseHandle(CreateThread(nullptr, 0, Init, nullptr, 0, nullptr));
     }
     return TRUE;

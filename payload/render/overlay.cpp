@@ -26,6 +26,13 @@ using Present_t    = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT);
 using Present1_t   = HRESULT(__stdcall*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
 using ResizeBuf_t  = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 
+// Indices reales de IDXGISwapChain / IDXGISwapChain1:
+//   IDXGIObject 0-6, IDXGIDeviceSubObject 7, Present 8, ResizeBuffers 13,
+//   Present1 18, GetCoreWindow 22. El 22 NO es Present1.
+constexpr size_t kIdxPresent  = 8;
+constexpr size_t kIdxResize   = 13;
+constexpr size_t kIdxPresent1 = 18;
+
 Present_t   o_present  = nullptr;
 Present1_t  o_present1 = nullptr;
 ResizeBuf_t o_resize   = nullptr;
@@ -252,6 +259,8 @@ LRESULT CALLBACK hkWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 bool Setup(IDXGISwapChain* swap) {
+    if (g_ready) return true;
+
     DXGI_SWAP_CHAIN_DESC desc{};
     if (FAILED(swap->GetDesc(&desc)) || !desc.OutputWindow) return false;
 
@@ -271,6 +280,7 @@ bool Setup(IDXGISwapChain* swap) {
         LogE("sin render target, overlay no dibuja");
     }
 
+    if (ImGui::GetCurrentContext()) ImGui::DestroyContext();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
@@ -363,13 +373,13 @@ HRESULT PrepareAndDraw(IDXGISwapChain* swap, bool& drew) {
     if (g_armed && g_frames % 120 == 0) {
         // Re-enganche con las funciones reales, nunca con lambdas: una llamada
         // swap->Present() vuelve a pasar por vtable[8] y se queda en bucle.
-        if (g_vtable[8] != reinterpret_cast<void*>(&hkPresent)) {
-            if (g_vtable[8]) o_present = reinterpret_cast<Present_t>(g_vtable[8]);
-            PatchSlot(g_vtable, 8, reinterpret_cast<void*>(&hkPresent), nullptr);
+        if (g_vtable[kIdxPresent] != reinterpret_cast<void*>(&hkPresent)) {
+            if (g_vtable[kIdxPresent]) o_present = reinterpret_cast<Present_t>(g_vtable[kIdxPresent]);
+            PatchSlot(g_vtable, kIdxPresent, reinterpret_cast<void*>(&hkPresent), nullptr);
         }
-        if (o_present1 && g_vtable[22] != reinterpret_cast<void*>(&hkPresent1)) {
-            if (g_vtable[22]) o_present1 = reinterpret_cast<Present1_t>(g_vtable[22]);
-            PatchSlot(g_vtable, 22, reinterpret_cast<void*>(&hkPresent1), nullptr);
+        if (o_present1 && g_vtable[kIdxPresent1] != reinterpret_cast<void*>(&hkPresent1)) {
+            if (g_vtable[kIdxPresent1]) o_present1 = reinterpret_cast<Present1_t>(g_vtable[kIdxPresent1]);
+            PatchSlot(g_vtable, kIdxPresent1, reinterpret_cast<void*>(&hkPresent1), nullptr);
         }
         if (g_hwnd && o_wndproc &&
             GetWindowLongPtrW(g_hwnd, GWLP_WNDPROC) != reinterpret_cast<LONG_PTR>(hkWndProc))
@@ -495,7 +505,7 @@ void** GrabVtable() {
     desc.SampleDesc.Count = 1;
     desc.Windowed = TRUE;
     // FLIP_DISCARD: es el modelo que usa FiveM/GTA. Con FLIP el objeto es un
-    // IDXGISwapChain1, asi que el indice 22 (Present1) existe de verdad.
+    // IDXGISwapChain1, asi que el indice 18 (Present1) existe de verdad.
     desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
     ID3D11Device* device = nullptr;
@@ -534,12 +544,12 @@ bool CreateSwapChainHook() {
     g_vtable = GrabVtable();
     if (!g_vtable) { LogE("no se pudo obtener la vtable de Present"); return false; }
 
-    const bool okP  = PatchSlot(g_vtable, 8, reinterpret_cast<void*>(&hkPresent),
+    const bool okP  = PatchSlot(g_vtable, kIdxPresent, reinterpret_cast<void*>(&hkPresent),
                                 reinterpret_cast<void**>(&o_present));
-    const bool okR  = PatchSlot(g_vtable, 13, reinterpret_cast<void*>(&hkResize),
+    const bool okR  = PatchSlot(g_vtable, kIdxResize, reinterpret_cast<void*>(&hkResize),
                                 reinterpret_cast<void**>(&o_resize));
-    const bool okP1 = (g_vtable[22] && g_vtable[22] != g_vtable[8])
-                        ? PatchSlot(g_vtable, 22, reinterpret_cast<void*>(&hkPresent1),
+    const bool okP1 = (g_vtable[kIdxPresent1] && g_vtable[kIdxPresent1] != g_vtable[kIdxPresent])
+                        ? PatchSlot(g_vtable, kIdxPresent1, reinterpret_cast<void*>(&hkPresent1),
                                     reinterpret_cast<void**>(&o_present1))
                         : false;
 
@@ -567,9 +577,9 @@ void shutdown() {
     for (int i = 0; i < 200 && g_inPresent; ++i) Sleep(5);
 
     if (g_armed) {
-        RestoreSlot(g_vtable, 8, reinterpret_cast<void*>(o_present));
-        RestoreSlot(g_vtable, 13, reinterpret_cast<void*>(o_resize));
-        RestoreSlot(g_vtable, 22, reinterpret_cast<void*>(o_present1));
+        RestoreSlot(g_vtable, kIdxPresent, reinterpret_cast<void*>(o_present));
+        RestoreSlot(g_vtable, kIdxResize, reinterpret_cast<void*>(o_resize));
+        RestoreSlot(g_vtable, kIdxPresent1, reinterpret_cast<void*>(o_present1));
         g_armed = false;
     }
 

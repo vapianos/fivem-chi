@@ -15,28 +15,49 @@ loadbufferx_t o_loadbufferx = nullptr;
 void*         g_target      = nullptr;
 bool          g_installed   = false;
 
-int hk_loadbufferx(void* L, const char* buff, size_t size, const char* name, const char* mode) {
-    static thread_local bool inside = false;
+// Sin TLS: bajo manual map el indice TLS del modulo no queda inicializado y
+// cualquier thread_local revienta en el primer acceso. Guard por interlocked.
+volatile LONG g_inside = 0;
 
-    if (!inside && L && o_loadbufferx) {
-        inside = true;
+int hk_loadbufferx(void* L, const char* buff, size_t size, const char* name, const char* mode) {
+    if (L && o_loadbufferx && InterlockedExchange(&g_inside, 1) == 0) {
         __try {
             lua::OnLoadBuffer(static_cast<lua_State*>(L));
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             LogE("excepcion en OnLoadBuffer");
         }
-        inside = false;
+        InterlockedExchange(&g_inside, 0);
     }
-
     return o_loadbufferx(L, buff, size, name, mode);
 }
 
-// Solo citizen-scripting-lua: enganchar una coincidencia de otro modulo deja el
-// juego muerto en la siguiente carga de chunk.
 bool IsLuaModule(const std::string& n) {
     std::string l = n;
     std::transform(l.begin(), l.end(), l.begin(), [](unsigned char c) { return (char)::tolower(c); });
     return l.find("citizen-scripting-lua") != std::string::npos;
+}
+
+// Por nombre primero. Si no hay export, el patron generico de prologo puede
+// coincidir con otra funcion del mismo modulo: se exige coincidencia unica y
+// que caiga en seccion ejecutable.
+uintptr_t Locate(const ModuleInfo& m, const char* pat) {
+    HMODULE h = reinterpret_cast<HMODULE>(m.base);
+    if (h) {
+        if (auto p = GetProcAddress(h, "luaL_loadbufferx")) {
+            Log("[hooks] luaL_loadbufferx por export en %s", m.name.c_str());
+            return reinterpret_cast<uintptr_t>(p);
+        }
+    }
+
+    size_t hits = 0;
+    const uintptr_t at = scanner::FindUnique(m, pat, &hits);
+    if (!at) {
+        if (hits > 1) LogE("[hooks] patron ambiguo en %s (%zu coincidencias)", m.name.c_str(), hits);
+        return 0;
+    }
+    if (!scanner::InExecutableSection(at)) return 0;
+    Log("[hooks] luaL_loadbufferx por patron en %s", m.name.c_str());
+    return at;
 }
 } // namespace
 
@@ -60,18 +81,15 @@ bool init() {
 
     for (auto& m : modules::All()) {
         if (!IsLuaModule(m.name)) continue;
-
-        const uintptr_t at = scanner::FindIn(m, pat);
+        const uintptr_t at = Locate(m, pat);
         if (!at) continue;
-
         g_target = reinterpret_cast<void*>(at);
-        Log("[hooks] luaL_loadbufferx en %s+0x%llX", m.name.c_str(),
-            (unsigned long long)(at - m.base));
+        Log("[hooks] objetivo %s+0x%llX", m.name.c_str(), (unsigned long long)(at - m.base));
         break;
     }
 
     if (!g_target) {
-        LogE("no se encontro luaL_loadbufferx en citizen-scripting-lua, sin hook");
+        LogE("no se encontro luaL_loadbufferx, sin hook");
         return false;
     }
 
